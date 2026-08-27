@@ -108,6 +108,7 @@ cargo test
 ```
 
 See [guide.md](guide.md) for the architecture and scaling boundaries.
+Measured multi-tenant memory and latency scenarios are recorded in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Deployment
 
