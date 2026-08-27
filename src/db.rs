@@ -4,10 +4,10 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{config::DatabaseSettings, error::AppError};
+use crate::{config::DatabaseSettings, error::AppError, metrics::Metrics};
 use dashmap::DashMap;
 use sqlx::{
     SqlitePool,
@@ -33,6 +33,7 @@ pub struct DatabaseManager {
     /// Caps in-flight work for the whole process. Without it, overload shows up
     /// as latency spread across every tenant instead of as a clear signal.
     slots: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
 }
 
 pub struct DatabaseEntry {
@@ -75,6 +76,7 @@ impl DatabaseManager {
             settings,
             entries: DashMap::new(),
             admission: Mutex::new(()),
+            metrics: Arc::new(Metrics::default()),
         })
     }
 
@@ -97,9 +99,11 @@ impl DatabaseManager {
             // database queues on its own share instead of occupying the
             // process-wide budget while it waits.
             let Some(tenant_slot) = self.wait_for_slot(&lease.entry.slots).await else {
+                self.metrics.record_shed();
                 return Err(AppError::Overloaded);
             };
             let Some(process_slot) = self.wait_for_slot(&self.slots).await else {
+                self.metrics.record_shed();
                 return Err(AppError::Overloaded);
             };
             lease._slots = Some((tenant_slot, process_slot));
@@ -121,13 +125,14 @@ impl DatabaseManager {
     /// `admission_timeout` is what turns overload into a 429 the caller can act
     /// on, instead of a queue that only shows up as p99 latency.
     async fn wait_for_slot(&self, slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
-        tokio::time::timeout(
+        let started = Instant::now();
+        let permit = tokio::time::timeout(
             self.settings.admission_timeout(),
             slots.clone().acquire_owned(),
         )
-        .await
-        .ok()?
-        .ok()
+        .await;
+        self.metrics.record_admission_wait(started.elapsed());
+        permit.ok()?.ok()
     }
 
     /// Returns the entry for `name`, admitting a new one when the database is
@@ -152,6 +157,7 @@ impl DatabaseManager {
             self.settings.max_concurrent_requests_per_database,
         ));
         self.entries.insert(name.to_owned(), entry.clone());
+        self.metrics.record_open();
         Ok(entry)
     }
 
@@ -177,6 +183,7 @@ impl DatabaseManager {
         };
         match self.take(&name) {
             Some(entry) => {
+                self.metrics.record_eviction();
                 tokio::spawn(close_entry(entry));
                 true
             }
@@ -210,6 +217,7 @@ impl DatabaseManager {
                 closed += 1;
             }
         }
+        self.metrics.record_idle_close(closed);
         Ok(closed)
     }
 
@@ -246,6 +254,7 @@ impl DatabaseManager {
                 }
             }
         }
+        self.metrics.record_checkpoints(checkpointed);
         checkpointed
     }
 
@@ -274,6 +283,9 @@ impl DatabaseManager {
             entry.begin_close();
             close_entry(entry).await;
         }
+    }
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
     pub fn max_result_rows(&self) -> usize {
         self.settings.max_result_rows
@@ -347,20 +359,20 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
         // Negative cache_size is KiB rather than pages, so the budget does not
         // silently change with page_size.
         .pragma("cache_size", format!("-{}", settings.cache_size_kb))
-        .pragma("mmap_size", (settings.mmap_size_mb * BYTES_PER_MB).to_string())
+        .pragma(
+            "mmap_size",
+            (settings.mmap_size_mb * BYTES_PER_MB).to_string(),
+        )
         .pragma("temp_store", "MEMORY");
     let acquire_timeout = Duration::from_secs(settings.acquire_timeout_seconds);
 
     // Autocheckpoint is off: with it on, whichever request happens to cross the
     // WAL threshold pays for the checkpoint of every other request before it.
     // The background task does that work instead.
-    let writer_options = shared
-        .clone()
-        .pragma("wal_autocheckpoint", "0")
-        .pragma(
-            "journal_size_limit",
-            (settings.wal_size_limit_mb * BYTES_PER_MB).to_string(),
-        );
+    let writer_options = shared.clone().pragma("wal_autocheckpoint", "0").pragma(
+        "journal_size_limit",
+        (settings.wal_size_limit_mb * BYTES_PER_MB).to_string(),
+    );
 
     // The writer is established eagerly: it creates the file, and paying for it
     // here keeps the cost inside the cold start instead of the first request.

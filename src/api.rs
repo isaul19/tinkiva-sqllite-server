@@ -1,9 +1,12 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Path, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::Response,
@@ -50,7 +53,9 @@ pub fn router(state: AppState) -> Router {
         .route("/db/{database}/execute", post(execute))
         .route("/db/{database}/batch", post(batch))
         .route("/admin/stats", get(stats))
-        .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
+        .route("/admin/metrics", get(metrics))
+        .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
+        .route_layer(middleware::from_fn_with_state(state.clone(), observe));
 
     Router::new()
         .route("/health", get(health))
@@ -347,6 +352,38 @@ async fn stats(State(state): State<AppState>) -> Json<crate::db::ManagerStats> {
     Json(state.manager.stats().await)
 }
 
+async fn metrics(
+    State(state): State<AppState>,
+) -> ([(header::HeaderName, &'static str); 1], String) {
+    let stats = state.manager.stats().await;
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.manager.metrics().render(&stats),
+    )
+}
+
+/// Times requests by their matched path, so the label set is the route table
+/// rather than the tenant list.
+async fn observe(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    let started = Instant::now();
+    let response = next.run(request).await;
+    if let Some(route) = route {
+        state.manager.metrics().record_request(
+            &route,
+            started.elapsed(),
+            response.status().is_success(),
+        );
+    }
+    response
+}
+
 fn validate_sql(sql: &str) -> Result<(), AppError> {
     if sql.trim().is_empty() {
         Err(AppError::InvalidRequest("sql must not be empty".into()))
@@ -457,6 +494,37 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["rows"][0]["name"], "book");
+    }
+
+    #[tokio::test]
+    async fn reports_metrics_labelled_by_route_not_tenant() {
+        let (app, _dir) = test_app(None).await;
+        for tenant in ["alpha", "beta"] {
+            let request = Request::post(format!("/v1/db/{tenant}/execute"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"sql":"CREATE TABLE t (id INTEGER)"}"#))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        let scrape = Request::get("/v1/admin/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(scrape).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains(
+            "tinkiva_requests_total{route=\"/v1/db/{database}/execute\",outcome=\"ok\"} 2"
+        ));
+        assert!(body.contains("tinkiva_databases_opened_total 2"));
+        assert!(body.contains("tinkiva_open_databases 2"));
+        assert!(
+            !body.contains("alpha"),
+            "tenant names must not become labels"
+        );
     }
 
     #[tokio::test]
@@ -606,12 +674,18 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            app.clone().oneshot(write_through_query).await.unwrap().status(),
+            app.clone()
+                .oneshot(write_through_query)
+                .await
+                .unwrap()
+                .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
         let count = Request::post("/v1/db/acme/query")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"sql":"SELECT count(*) AS total FROM items"}"#))
+            .body(Body::from(
+                r#"{"sql":"SELECT count(*) AS total FROM items"}"#,
+            ))
             .unwrap();
         let response = app.oneshot(count).await.unwrap();
         let body: Value =
