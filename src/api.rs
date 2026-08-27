@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -11,7 +11,10 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use futures_util::TryStreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize, Serializer,
+    ser::{SerializeMap, SerializeSeq, SerializeStruct},
+};
 use serde_json::Value;
 use sqlx::{
     Column, Row, Sqlite, TypeInfo, ValueRef,
@@ -20,6 +23,7 @@ use sqlx::{
 use subtle::ConstantTimeEq;
 use tower_http::{
     catch_panic::CatchPanicLayer,
+    compression::CompressionLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
@@ -59,6 +63,10 @@ pub fn router(state: AppState) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(state.settings.server.request_timeout_seconds),
         ))
+        // Result sets are highly repetitive JSON; over a network this is
+        // the cheapest bandwidth win available. It is a no-op for clients
+        // that do not advertise an encoding.
+        .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
@@ -96,6 +104,18 @@ pub struct SqlRequest {
     pub sql: String,
     #[serde(default)]
     pub params: Vec<Value>,
+    #[serde(default)]
+    pub format: RowFormat,
+}
+
+/// `arrays` drops the repeated column names from every row. On a wide result
+/// set that is most of the payload.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowFormat {
+    #[default]
+    Objects,
+    Arrays,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,11 +123,67 @@ pub struct BatchRequest {
     pub statements: Vec<SqlRequest>,
 }
 
-#[derive(Debug, Serialize)]
+/// Rows are always held as positional values. The object shape is produced
+/// during serialization by borrowing the column names, so a result set costs
+/// one allocation per cell instead of one per cell plus one key per cell.
+#[derive(Debug)]
 pub struct QueryResponse {
     pub columns: Vec<String>,
-    pub rows: Vec<BTreeMap<String, Value>>,
+    pub rows: Vec<Vec<Value>>,
+    pub format: RowFormat,
     pub truncated: bool,
+}
+
+impl Serialize for QueryResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut response = serializer.serialize_struct("QueryResponse", 3)?;
+        response.serialize_field("columns", &self.columns)?;
+        match self.format {
+            RowFormat::Arrays => response.serialize_field("rows", &self.rows)?,
+            RowFormat::Objects => response.serialize_field(
+                "rows",
+                &RowsAsObjects {
+                    columns: &self.columns,
+                    rows: &self.rows,
+                },
+            )?,
+        }
+        response.serialize_field("truncated", &self.truncated)?;
+        response.end()
+    }
+}
+
+struct RowsAsObjects<'a> {
+    columns: &'a [String],
+    rows: &'a [Vec<Value>],
+}
+
+impl Serialize for RowsAsObjects<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.rows.len()))?;
+        for row in self.rows {
+            sequence.serialize_element(&RowAsObject {
+                columns: self.columns,
+                values: row,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct RowAsObject<'a> {
+    columns: &'a [String],
+    values: &'a [Value],
+}
+
+impl Serialize for RowAsObject<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.values.len()))?;
+        for (column, value) in self.columns.iter().zip(self.values) {
+            map.serialize_entry(column.as_str(), value)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +205,7 @@ async fn query(
     Json(request): Json<SqlRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
     validate_sql(&request.sql)?;
+    let format = request.format;
     let lease = state.manager.acquire(&database).await?;
     let mut stream = bind_query(&request.sql, request.params)?.fetch(lease.readers());
     let limit = state.manager.max_result_rows();
@@ -136,6 +213,7 @@ async fn query(
     let mut columns = Vec::new();
     let mut truncated = false;
     while let Some(row) = stream.try_next().await? {
+        // Column names are read once per result set, not once per row.
         if columns.is_empty() {
             columns = row
                 .columns()
@@ -147,11 +225,12 @@ async fn query(
             truncated = true;
             break;
         }
-        rows.push(row_to_json(&row)?);
+        rows.push(row_values(&row)?);
     }
     Ok(Json(QueryResponse {
         columns,
         rows,
+        format,
         truncated,
     }))
 }
@@ -239,9 +318,9 @@ fn bind_query<'q>(
     Ok(query)
 }
 
-fn row_to_json(row: &SqliteRow) -> Result<BTreeMap<String, Value>, sqlx::Error> {
-    let mut result = BTreeMap::new();
-    for (index, column) in row.columns().iter().enumerate() {
+fn row_values(row: &SqliteRow) -> Result<Vec<Value>, sqlx::Error> {
+    let mut values = Vec::with_capacity(row.columns().len());
+    for index in 0..row.columns().len() {
         let raw = row.try_get_raw(index)?;
         let value = if raw.is_null() {
             Value::Null
@@ -255,9 +334,9 @@ fn row_to_json(row: &SqliteRow) -> Result<BTreeMap<String, Value>, sqlx::Error> 
                 _ => Value::from(row.try_get::<String, _>(index)?),
             }
         };
-        result.insert(column.name().to_owned(), value);
+        values.push(value);
     }
-    Ok(result)
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -371,6 +450,48 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["rows"][0]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn serves_rows_as_objects_or_arrays() {
+        let (app, _dir) = test_app(None).await;
+        for sql in [
+            r#"{"sql":"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"}"#,
+            r#"{"sql":"INSERT INTO items(name) VALUES (?)","params":["book"]}"#,
+        ] {
+            let request = Request::post("/v1/db/acme/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(sql))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+
+        let objects = Request::post("/v1/db/acme/query")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"sql":"SELECT id, name FROM items"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(objects).await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["columns"], serde_json::json!(["id", "name"]));
+        assert_eq!(body["rows"][0]["name"], "book");
+
+        let arrays = Request::post("/v1/db/acme/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"SELECT id, name FROM items","format":"arrays"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(arrays).await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["columns"], serde_json::json!(["id", "name"]));
+        assert_eq!(body["rows"], serde_json::json!([[1, "book"]]));
     }
 
     #[tokio::test]
