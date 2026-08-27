@@ -206,6 +206,13 @@ READ_SCAN = {
     "sql": "SELECT count(*) AS total, sum(counter) AS clicks FROM items WHERE payload LIKE ?",
     "rotating_param": False,
 }
+READ_CHURN = {
+    "sql": "SELECT id, payload, counter FROM items WHERE category = ? ORDER BY id LIMIT 100",
+    "rotating_param": True,
+    # SQL comments produce distinct prepared-statement cache keys without
+    # changing the query plan or result set.
+    "variants": 100,
+}
 WRITE_POINT = {
     "sql": "UPDATE items SET counter = counter + 1 WHERE id = ?",
     "rotating_param": True,
@@ -235,7 +242,10 @@ def worker(host, port, tenant, operation, start, stop_at):
                     param = "%0000%"
             before = time.perf_counter()
             try:
-                client.post(path, {"sql": operation["sql"], "params": [param]})
+                sql = operation["sql"]
+                if operation.get("variants"):
+                    sql += f" -- variant {cursor % operation['variants']}"
+                client.post(path, {"sql": sql, "params": [param]})
                 operations += 1
                 latencies.append((time.perf_counter() - before) * 1000)
             except Exception:
@@ -506,6 +516,22 @@ SCENARIOS = [
         "readers": 4,
         "writers": 1,
         "read": READ_SCAN,
+    },
+    {
+        "name": "50db-statement-churn",
+        "databases": 50,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 1,
+        "read": READ_CHURN,
+    },
+    {
+        "name": "50db-statement-churn-readonly",
+        "databases": 50,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 0,
+        "read": READ_CHURN,
     },
     {
         "name": "20db-openloop-2000",

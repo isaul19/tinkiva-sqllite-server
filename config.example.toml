@@ -31,6 +31,9 @@ admission_timeout_ms = 50
 # budgets avoid paying the full reader cache twice for every hot tenant.
 writer_cache_size_kb = 1024
 reader_cache_size_kb = 512
+# Per connection. Parameterized queries reuse entries; SQL text churn is
+# evicted instead of growing to sqlx's default of 100 statements.
+statement_cache_capacity = 16
 
 # Mapped bytes per connection; file-backed and evictable, unlike page cache.
 mmap_size_mb = 64

@@ -96,6 +96,7 @@ most frequently changed values:
 - `TINKIVA_WRITER_CACHE_SIZE_KB`
 - `TINKIVA_READER_CACHE_SIZE_KB`
 - `TINKIVA_CACHE_SIZE_KB` (legacy override for both roles)
+- `TINKIVA_STATEMENT_CACHE_CAPACITY`
 - `TINKIVA_MMAP_SIZE_MB`
 - `TINKIVA_MAX_CONCURRENT_REQUESTS`
 - `TINKIVA_MAX_CONCURRENT_REQUESTS_PER_DATABASE`
@@ -114,6 +115,8 @@ credentials and policy enforcement are not part of this MVP.
 - Writer and reader page caches have separate budgets because their working sets differ. Resident
   memory is roughly `writer_cache_size_kb + readers × reader_cache_size_kb` per hot database. The
   `mmap_size_mb` window is file-backed and evictable, so it does not add private memory.
+- The prepared-statement cache is bounded per connection. Parameterized SQL reuses a small number of
+  entries; continuously changing SQL text is evicted instead of accumulating across every tenant.
 - A lease counter protects in-flight requests from idle cleanup or LRU eviction.
 - When capacity is full, the least-recently-used inactive database is checkpointed and closed.
 - If every open database is active, a new tenant receives HTTP `503 capacity_busy`.

@@ -73,6 +73,9 @@ pub struct DatabaseSettings {
     pub writer_cache_size_kb: u32,
     /// SQLite page cache for each reader connection.
     pub reader_cache_size_kb: u32,
+    /// Prepared statements retained by sqlx on each connection. Zero disables
+    /// the cache; a small bound protects multi-tenant density from SQL churn.
+    pub statement_cache_capacity: usize,
     /// Bytes mapped per connection. Mapped pages are file-backed and
     /// evictable, so they cost far less than private page cache.
     pub mmap_size_mb: u64,
@@ -98,6 +101,7 @@ impl Default for DatabaseSettings {
             cache_size_kb: None,
             writer_cache_size_kb: 1_024,
             reader_cache_size_kb: 512,
+            statement_cache_capacity: 16,
             mmap_size_mb: 64,
             wal_size_limit_mb: 16,
         }
@@ -190,6 +194,10 @@ impl Settings {
         set_number(
             "TINKIVA_READER_CACHE_SIZE_KB",
             &mut self.database.reader_cache_size_kb,
+        )?;
+        set_number(
+            "TINKIVA_STATEMENT_CACHE_CAPACITY",
+            &mut self.database.statement_cache_capacity,
         )?;
         set_number(
             "TINKIVA_MAX_CONCURRENT_REQUESTS",

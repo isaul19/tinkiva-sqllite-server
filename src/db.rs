@@ -359,6 +359,7 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_millis(settings.busy_timeout_ms))
+        .statement_cache_capacity(settings.statement_cache_capacity)
         .pragma(
             "mmap_size",
             (settings.mmap_size_mb * BYTES_PER_MB).to_string(),

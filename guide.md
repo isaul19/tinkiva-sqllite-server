@@ -110,6 +110,10 @@ del archivo, compartidas y desalojables.
 Puede haber miles de archivos dormidos sin crear miles de pools. El número apropiado depende de la
 RAM, el patrón de consultas, el page cache y la latencia del volumen.
 
+sqlx también mantiene un caché de sentencias preparadas por conexión. TinkivaDatabase lo limita con
+`statement_cache_capacity`; usar parámetros (`?`) conserva una clave reutilizable, mientras que generar
+texto SQL distinto en cada request provoca expulsiones y recompilaciones controladas.
+
 La API también limita:
 
 - tamaño del body para evitar cargas descontroladas;
