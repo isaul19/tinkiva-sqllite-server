@@ -1,0 +1,7 @@
+/target
+/.git
+/.codegraph
+/data
+*.db
+*.db-shm
+*.db-wal

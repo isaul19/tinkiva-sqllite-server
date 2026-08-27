@@ -1,0 +1,19 @@
+services:
+  tinkiva-database:
+    build: .
+    restart: unless-stopped
+    environment:
+      TINKIVA_AUTH_TOKEN: "${TINKIVA_AUTH_TOKEN:?Set TINKIVA_AUTH_TOKEN}"
+      TINKIVA_MAX_OPEN_DATABASES: "50"
+      TINKIVA_CONNECTIONS_PER_DATABASE: "2"
+      RUST_LOG: "tinkiva_database=info,tower_http=info"
+    ports:
+      - "127.0.0.1:7000:7000"
+    volumes:
+      - tinkiva-data:/var/lib/tinkivadb/databases
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  tinkiva-data:

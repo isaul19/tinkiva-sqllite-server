@@ -1,0 +1,24 @@
+[Unit]
+Description=TinkivaDatabase multi-tenant SQLite gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tinkiva
+Group=tinkiva
+ExecStart=/usr/local/bin/tinkiva-database --config /etc/tinkivadb/config.toml
+EnvironmentFile=-/etc/tinkivadb/environment
+WorkingDirectory=/var/lib/tinkivadb
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tinkivadb/databases
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

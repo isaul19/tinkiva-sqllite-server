@@ -108,3 +108,21 @@ cargo test
 ```
 
 See [guide.md](guide.md) for the architecture and scaling boundaries.
+
+## Deployment
+
+For a container deployment, set a token and start the included Compose stack:
+
+```bash
+export TINKIVA_AUTH_TOKEN="replace-with-a-long-random-value"
+docker compose up -d --build
+```
+
+The named volume contains the durable database files, while the container runs as an unprivileged
+user and publishes the service on host loopback. Put a TLS reverse proxy in front if remote clients
+need access.
+
+For a small Linux VM without containers, build the release binary, create a `tinkiva` system user,
+place configuration under `/etc/tinkivadb`, data under `/var/lib/tinkivadb/databases`, and install the
+unit from `deploy/tinkiva-database.service`. The unit restricts filesystem access to the data directory
+and gives graceful shutdown 30 seconds to checkpoint pools.
