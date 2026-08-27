@@ -8,7 +8,7 @@ use tinkiva_database::{
     db::DatabaseManager,
 };
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -38,6 +38,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Requests never checkpoint, so this task is what keeps the WAL bounded.
+    let checkpoint_manager = manager.clone();
+    let checkpoint_interval = settings.database.checkpoint_interval();
+    let checkpoint_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(checkpoint_interval);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let checkpointed = checkpoint_manager.checkpoint_wal().await;
+            debug!(databases = checkpointed, "checkpointed open databases");
+        }
+    });
+
     let listener = TcpListener::bind(&settings.server.bind)
         .await
         .with_context(|| format!("failed to bind {}", settings.server.bind))?;
@@ -47,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("HTTP server failed")?;
     cleanup_task.abort();
+    checkpoint_task.abort();
     manager.close_all().await;
     info!("TinkivaDatabase stopped");
     Ok(())

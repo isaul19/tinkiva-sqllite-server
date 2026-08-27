@@ -21,6 +21,8 @@ const CLOSED: usize = usize::MAX;
 /// Bound on how many times a caller retries around a concurrent eviction.
 const MAX_ATTEMPTS: usize = 16;
 
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
 pub struct DatabaseManager {
     settings: DatabaseSettings,
     entries: DashMap<String, Arc<DatabaseEntry>>,
@@ -165,6 +167,37 @@ impl DatabaseManager {
         Ok(closed)
     }
 
+    /// Checkpoints every open database's WAL. Runs on its own schedule so that
+    /// no request ever performs a checkpoint. PASSIVE never blocks a reader or
+    /// the writer: if the database is busy it simply does less work this round.
+    pub async fn checkpoint_wal(&self) -> usize {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let mut checkpointed = 0;
+        for entry in entries {
+            if !entry.lease() {
+                continue;
+            }
+            let lease = DatabaseLease(entry);
+            if lease.0.pools.get().is_none() {
+                continue;
+            }
+            match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .execute(lease.writer())
+                .await
+            {
+                Ok(_) => checkpointed += 1,
+                Err(error) => {
+                    tracing::warn!(database = %lease.0.name, %error, "wal checkpoint failed");
+                }
+            }
+        }
+        checkpointed
+    }
+
     pub async fn stats(&self) -> ManagerStats {
         ManagerStats {
             open_databases: self.entries.len(),
@@ -250,14 +283,30 @@ impl DatabaseEntry {
 }
 
 async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools, sqlx::Error> {
-    let options = SqliteConnectOptions::new()
+    let shared = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(settings.busy_timeout_ms));
+        .busy_timeout(Duration::from_millis(settings.busy_timeout_ms))
+        // Negative cache_size is KiB rather than pages, so the budget does not
+        // silently change with page_size.
+        .pragma("cache_size", format!("-{}", settings.cache_size_kb))
+        .pragma("mmap_size", (settings.mmap_size_mb * BYTES_PER_MB).to_string())
+        .pragma("temp_store", "MEMORY");
     let acquire_timeout = Duration::from_secs(settings.acquire_timeout_seconds);
+
+    // Autocheckpoint is off: with it on, whichever request happens to cross the
+    // WAL threshold pays for the checkpoint of every other request before it.
+    // The background task does that work instead.
+    let writer_options = shared
+        .clone()
+        .pragma("wal_autocheckpoint", "0")
+        .pragma(
+            "journal_size_limit",
+            (settings.wal_size_limit_mb * BYTES_PER_MB).to_string(),
+        );
 
     // The writer is established eagerly: it creates the file, and paying for it
     // here keeps the cost inside the cold start instead of the first request.
@@ -265,7 +314,7 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
         .max_connections(1)
         .min_connections(1)
         .acquire_timeout(acquire_timeout)
-        .connect_with(options.clone())
+        .connect_with(writer_options)
         .await?;
 
     // Readers stay lazy, so a database that is only written never pays for
@@ -274,7 +323,7 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
     let readers = SqlitePoolOptions::new()
         .max_connections(settings.reader_connections)
         .acquire_timeout(acquire_timeout)
-        .connect_lazy_with(options.pragma("query_only", "ON"));
+        .connect_lazy_with(shared.pragma("query_only", "ON"));
 
     Ok(Pools { writer, readers })
 }
@@ -304,6 +353,9 @@ async fn close_entry(entry: Arc<DatabaseEntry>) {
     };
     // Readers hold WAL read marks that would block the checkpoint.
     pools.readers.close().await;
+    // Sleeping is the one moment where refreshing the planner statistics costs
+    // no request any latency.
+    let _ = sqlx::query("PRAGMA optimize").execute(&pools.writer).await;
     let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(&pools.writer)
         .await;
@@ -390,6 +442,41 @@ mod tests {
         drop(active);
         assert_eq!(manager.cleanup_idle().await.unwrap(), 1);
         assert_eq!(manager.stats().await.open_databases, 0);
+    }
+
+    #[tokio::test]
+    async fn background_checkpoint_drains_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            ..Default::default()
+        };
+        let manager = DatabaseManager::new(settings).await.unwrap();
+        let lease = manager.acquire("tenant").await.unwrap();
+        sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT)")
+            .execute(lease.writer())
+            .await
+            .unwrap();
+        for index in 0..500 {
+            sqlx::query("INSERT INTO items(payload) VALUES (?)")
+                .bind(format!("{index:0512}"))
+                .execute(lease.writer())
+                .await
+                .unwrap();
+        }
+        let wal = dir.path().join("tenant.db-wal");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        assert!(before > 0, "autocheckpoint should be off, leaving a WAL");
+        drop(lease);
+        assert_eq!(manager.checkpoint_wal().await, 1);
+        assert!(std::fs::metadata(&wal).unwrap().len() <= before);
+        assert!(
+            sqlx::query("SELECT count(*) FROM items")
+                .fetch_one(manager.acquire("tenant").await.unwrap().readers())
+                .await
+                .is_ok()
+        );
+        manager.close_all().await;
     }
 
     #[tokio::test]

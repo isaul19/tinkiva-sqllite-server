@@ -10,8 +10,15 @@ directory = "./data/databases"
 max_open_databases = 50
 idle_timeout_seconds = 300
 cleanup_interval_seconds = 30
+# Requests never checkpoint; this is what bounds WAL growth.
+checkpoint_interval_seconds = 10
 # Read connections per database. One writer connection is always implied.
 reader_connections = 2
 busy_timeout_ms = 5000
 acquire_timeout_seconds = 10
 max_result_rows = 10000
+# Page cache per connection: the main dial for resident memory per tenant.
+cache_size_kb = 2000
+# Mapped bytes per connection; file-backed and evictable, unlike page cache.
+mmap_size_mb = 64
+wal_size_limit_mb = 16

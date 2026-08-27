@@ -50,12 +50,23 @@ pub struct DatabaseSettings {
     pub max_open_databases: usize,
     pub idle_timeout_seconds: u64,
     pub cleanup_interval_seconds: u64,
+    /// How often WAL checkpoints run in the background. Requests never
+    /// checkpoint, so this is the only thing that bounds WAL growth.
+    pub checkpoint_interval_seconds: u64,
     /// Read connections per database. One writer connection is always
     /// implied and is never shared with readers.
     pub reader_connections: u32,
     pub busy_timeout_ms: u64,
     pub acquire_timeout_seconds: u64,
     pub max_result_rows: usize,
+    /// SQLite page cache per connection. Multiplied by the connections of
+    /// every hot database, this is the dial that sets resident memory.
+    pub cache_size_kb: u32,
+    /// Bytes mapped per connection. Mapped pages are file-backed and
+    /// evictable, so they cost far less than private page cache.
+    pub mmap_size_mb: u64,
+    /// Size the WAL is trimmed back to after a checkpoint.
+    pub wal_size_limit_mb: u64,
 }
 
 impl Default for DatabaseSettings {
@@ -65,10 +76,14 @@ impl Default for DatabaseSettings {
             max_open_databases: 50,
             idle_timeout_seconds: 300,
             cleanup_interval_seconds: 30,
+            checkpoint_interval_seconds: 10,
             reader_connections: 2,
             busy_timeout_ms: 5_000,
             acquire_timeout_seconds: 10,
             max_result_rows: 10_000,
+            cache_size_kb: 2_000,
+            mmap_size_mb: 64,
+            wal_size_limit_mb: 16,
         }
     }
 }
@@ -79,6 +94,9 @@ impl DatabaseSettings {
     }
     pub fn cleanup_interval(&self) -> Duration {
         Duration::from_secs(self.cleanup_interval_seconds)
+    }
+    pub fn checkpoint_interval(&self) -> Duration {
+        Duration::from_secs(self.checkpoint_interval_seconds)
     }
 }
 
@@ -117,6 +135,8 @@ impl Settings {
             "TINKIVA_MAX_RESULT_ROWS",
             &mut self.database.max_result_rows,
         )?;
+        set_number("TINKIVA_CACHE_SIZE_KB", &mut self.database.cache_size_kb)?;
+        set_number("TINKIVA_MMAP_SIZE_MB", &mut self.database.mmap_size_mb)?;
         Ok(())
     }
 
@@ -129,6 +149,12 @@ impl Settings {
         }
         if self.database.cleanup_interval_seconds == 0 {
             bail!("cleanup_interval_seconds must be greater than zero");
+        }
+        if self.database.checkpoint_interval_seconds == 0 {
+            bail!("checkpoint_interval_seconds must be greater than zero");
+        }
+        if self.database.cache_size_kb == 0 {
+            bail!("cache_size_kb must be greater than zero");
         }
         if self.database.max_result_rows == 0 {
             bail!("max_result_rows must be greater than zero");
