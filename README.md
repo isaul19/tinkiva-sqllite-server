@@ -43,6 +43,11 @@ All request bodies are JSON. Parameters are positional and correspond to SQLite 
 Arrays and objects are stored as JSON text. BLOB results are represented as
 `{"$blob":"<base64>"}`.
 
+`/query` runs on read-only connections, so it rejects statements that write; those belong on
+`/execute` or `/batch`. Any request may add `"format": "arrays"` to receive rows as positional
+arrays instead of repeating the column names on every row, which on a wide result set is most of
+the payload.
+
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Unauthenticated liveness check |
@@ -50,6 +55,7 @@ Arrays and objects are stored as JSON text. BLOB results are represented as
 | `POST` | `/v1/db/{database}/execute` | Run one DDL/DML statement |
 | `POST` | `/v1/db/{database}/batch` | Run multiple DDL/DML statements atomically |
 | `GET` | `/v1/admin/stats` | Report open databases, active leases, and capacity |
+| `GET` | `/v1/admin/metrics` | Prometheus metrics: latency per route, admission wait, shed requests |
 
 Batch body:
 
@@ -62,8 +68,10 @@ Batch body:
 }
 ```
 
-The batch is rolled back automatically if any statement fails. Query results stop at
-`max_result_rows` and return `"truncated": true` when more rows exist.
+The batch is rolled back automatically if any statement fails. Every statement reports the rows it
+returned alongside `rows_affected` and `last_insert_rowid`, so a read-modify-read sequence fits in
+one request and one transaction. Results stop at `max_result_rows` and return `"truncated": true`
+when more rows exist.
 
 Database names accept 1–64 ASCII letters, digits, `-`, and `_`, and must start with a letter or
 digit. This prevents path traversal and makes each tenant map to exactly one file.
@@ -79,8 +87,11 @@ most frequently changed values:
 - `TINKIVA_DATABASE_DIR`
 - `TINKIVA_MAX_OPEN_DATABASES`
 - `TINKIVA_IDLE_TIMEOUT_SECONDS`
-- `TINKIVA_CONNECTIONS_PER_DATABASE`
+- `TINKIVA_READER_CONNECTIONS`
 - `TINKIVA_MAX_RESULT_ROWS`
+- `TINKIVA_CACHE_SIZE_KB`
+- `TINKIVA_MMAP_SIZE_MB`
+- `TINKIVA_MAX_CONCURRENT_REQUESTS`
 - `RUST_LOG` (for example, `tinkiva_database=debug,tower_http=info`)
 
 Use TLS at a reverse proxy and set a strong bearer token before exposing the service to a network.
@@ -90,9 +101,17 @@ credentials and policy enforcement are not part of this MVP.
 ## Operational model
 
 - SQLite runs in WAL mode with `synchronous=NORMAL`, foreign keys enabled, and a busy timeout.
+- Each database gets one writer connection and a separate reader pool, so a write never blocks a
+  read. The reader pool is lazy: a database that is only written never opens reader connections.
+- Resident memory per hot database is roughly `connections × cache_size_kb`. The `mmap_size_mb`
+  window is file-backed and evictable, so it does not add private memory.
 - A lease counter protects in-flight requests from idle cleanup or LRU eviction.
 - When capacity is full, the least-recently-used inactive database is checkpointed and closed.
 - If every open database is active, a new tenant receives HTTP `503 capacity_busy`.
+- Requests take a per-database slot and a process-wide slot. Past `admission_timeout_ms` the request
+  is shed with HTTP `429 overloaded` and a `Retry-After`, rather than queued into latency.
+- WAL checkpoints run on a background timer, so no request pays for one under normal load;
+  `wal_size_limit_mb` is the ceiling at which a request will checkpoint as a last resort.
 - Graceful shutdown checkpoints and closes all managed pools.
 - Database files remain on local persistent storage while sleeping; no remote cold tier exists.
 
@@ -108,7 +127,8 @@ cargo test
 ```
 
 See [guide.md](guide.md) for the architecture and scaling boundaries.
-Measured multi-tenant memory and latency scenarios are recorded in [BENCHMARKS.md](BENCHMARKS.md).
+Measured multi-tenant throughput, memory and latency are recorded in [BENCHMARKS.md](BENCHMARKS.md),
+including an A/B against the previous build under one client.
 
 ## Deployment
 

@@ -27,14 +27,23 @@ La caché de páginas que pueda conservar el sistema operativo es recuperable.
 
 1. La API valida el nombre del tenant para impedir rutas arbitrarias.
 2. `DatabaseManager` busca su entrada caliente.
-3. Si ya existe, incrementa su lease y reutiliza el pool.
+3. Si ya existe, incrementa su lease y reutiliza sus pools.
 4. Si no existe, crea o abre `{tenant}.db` con WAL y los pragmas configurados.
 5. Si se alcanzó `max_open_databases`, elimina primero la base inactiva menos reciente.
-6. La operación SQL se ejecuta con parámetros posicionales.
-7. Al terminar, el lease disminuye y actualiza la hora del último uso.
+6. La solicitud toma una plaza de admisión de su tenant y otra del proceso; si no la consigue dentro
+   de `admission_timeout_ms`, se descarta con `429 overloaded`.
+7. La operación SQL se ejecuta con parámetros posicionales: `/query` sobre el pool de lectores,
+   `/execute` y `/batch` sobre la conexión de escritura.
+8. Al terminar, el lease disminuye y actualiza la hora del último uso.
 
-El mutex del administrador serializa únicamente la búsqueda/apertura de pools. Las consultas se
-ejecutan fuera de ese mutex y pueden avanzar simultáneamente según `connections_per_database`.
+El registro de bases es un mapa concurrente: encontrar una base caliente no toma ningún cerrojo
+global. Solo la admisión de tenants nuevos se serializa, y ese cerrojo nunca se mantiene mientras se
+abre una base, de modo que un arranque en frío no bloquea al resto de tenants.
+
+Cada base tiene una sola conexión de escritura, porque SQLite serializa las escrituras sobre el
+archivo sin importar cuántas conexiones existan, y un pool aparte de `reader_connections` lectores
+con sus propias instantáneas del WAL. Los lectores se abren con `query_only`, así que una escritura
+enviada a `/query` es rechazada.
 
 ## Dormir una base con seguridad
 
@@ -49,11 +58,24 @@ y cierra el pool. Esto evita cortar consultas en curso y reduce el WAL antes de 
 estado dormido. Si el checkpoint no puede completarse, el cierre sigue siendo seguro: SQLite conserva
 el WAL para recuperarlo al abrir de nuevo.
 
+## Checkpoints del WAL
+
+Una tarea aparte ejecuta `PRAGMA wal_checkpoint(PASSIVE)` sobre cada base abierta cada
+`checkpoint_interval_seconds`. PASSIVE nunca bloquea a un lector ni al escritor: si la base está
+ocupada, simplemente hace menos trabajo en esa ronda.
+
+El autocheckpoint de SQLite no se desactiva, se eleva hasta `wal_size_limit_mb`. Desactivarlo por
+completo deja el WAL sin techo cuando las escrituras superan al temporizador. Con este ajuste una
+solicitud solo hace checkpoint como último recurso, y `journal_size_limit` recorta el archivo
+después.
+
 ## Concurrencia y consistencia
 
 SQLite permite múltiples lectores, pero solo un escritor por archivo. WAL mejora la convivencia entre
 lecturas y escritura; no convierte SQLite en una base distribuida. `busy_timeout_ms` hace que una
-escritura espere brevemente ante contención en lugar de fallar inmediatamente.
+escritura espere brevemente ante contención en lugar de fallar inmediatamente. Separar el pool de
+lectura del escritor traslada esa convivencia al servicio: las escrituras hacen cola en una sola
+conexión y las lecturas nunca esperan detrás de ellas.
 
 Para cambios que deban ser atómicos, `/batch` usa una sola transacción y conexión. No hay transacciones
 abiertas entre solicitudes HTTP.
@@ -74,10 +96,15 @@ router de tenants
 El límite principal es:
 
 ```text
-conexiones máximas ≈ max_open_databases × connections_per_database
+conexiones máximas ≈ max_open_databases × (1 + reader_connections)
 ```
 
-Con 50 bases abiertas y 2 conexiones por base, el techo es aproximadamente 100 conexiones SQLite.
+Con 50 bases abiertas y 2 lectores por base, el techo es aproximadamente 150 conexiones SQLite. El
+driver de sqlx dedica un hilo del sistema operativo a cada conexión, así que ese número también es
+el techo de hilos: es el límite estructural al escalar hacia miles de tenants calientes.
+
+La memoria residente por base caliente es aproximadamente `conexiones × cache_size_kb`. La ventana
+`mmap_size_mb` no cuenta como memoria privada: son páginas del archivo, compartidas y desalojables.
 Puede haber miles de archivos dormidos sin crear miles de pools. El número apropiado depende de la
 RAM, el patrón de consultas, el page cache y la latencia del volumen.
 
@@ -85,6 +112,8 @@ La API también limita:
 
 - tamaño del body para evitar cargas descontroladas;
 - duración de cada solicitud;
+- solicitudes simultáneas por base y por proceso, descartando el exceso con `429` en vez de
+  absorberlo como latencia;
 - filas materializadas por consulta;
 - longitud y caracteres del identificador de tenant.
 
@@ -113,10 +142,11 @@ SQLite recupere una transacción consistente al volver a abrir el archivo.
 Incluido:
 
 - activación bajo demanda y creación lazy;
-- pools limitados por base;
+- un escritor y un pool de lectores por base;
 - evicción LRU y timeout inactivo;
-- WAL, claves foráneas, timeout de escritura y checkpoint;
-- endpoints de consulta, ejecución, batch, salud y estadísticas;
+- WAL, claves foráneas, timeout de escritura y checkpoint en segundo plano;
+- control de admisión por tenant y por proceso, con descarte explícito;
+- endpoints de consulta, ejecución, batch, salud, estadísticas y métricas Prometheus;
 - autenticación bearer, límites HTTP y apagado ordenado.
 
 No incluido todavía:
