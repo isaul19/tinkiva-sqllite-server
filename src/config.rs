@@ -94,7 +94,7 @@ impl Default for DatabaseSettings {
             max_result_rows: 10_000,
             max_concurrent_requests: 512,
             max_concurrent_requests_per_database: 8,
-            admission_timeout_ms: 250,
+            admission_timeout_ms: 50,
             cache_size_kb: None,
             writer_cache_size_kb: 1_024,
             reader_cache_size_kb: 512,

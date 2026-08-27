@@ -142,7 +142,7 @@ class Client:
                 response = self.connection.getresponse()
                 data = response.read()
                 if response.status >= 400:
-                    raise RuntimeError(f"HTTP {response.status}")
+                    raise HttpStatusError(response.status)
                 return data
             except (http.client.HTTPException, OSError):
                 self.close()
@@ -153,6 +153,12 @@ class Client:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
+
+
+class HttpStatusError(RuntimeError):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status = status
 
 
 def request(base_url, path, body=None):
@@ -239,6 +245,107 @@ def worker(host, port, tenant, operation, start, stop_at):
     return operation is WRITE_POINT, operations, errors, latencies
 
 
+def fixed_rate_request(local, host, port, tenant, operation, parameter):
+    client = getattr(local, "client", None)
+    if client is None:
+        client = Client(host, port)
+        client.connect()
+        local.client = client
+    path = f"/v1/db/{tenant}/{'execute' if operation is WRITE_POINT else 'query'}"
+    before = time.perf_counter()
+    try:
+        client.post(path, {"sql": operation["sql"], "params": [parameter]})
+        return operation is WRITE_POINT, 200, (time.perf_counter() - before) * 1000
+    except HttpStatusError as error:
+        return operation is WRITE_POINT, error.status, (time.perf_counter() - before) * 1000
+    except Exception:
+        return operation is WRITE_POINT, 0, (time.perf_counter() - before) * 1000
+
+
+def fixed_rate_load(host, port, databases, readers, writers, read_operation, rate, duration, max_outstanding):
+    """Issue work by the clock, independently of response latency.
+
+    A closed loop lowers its own offered rate as latency grows. This scheduler
+    keeps offering the configured rate and caps only the client-side backlog,
+    which lets the server's admission control produce observable 429s.
+    """
+    local = threading.local()
+    pending = set()
+    latencies = []
+    reads = writes = shed = http_errors = transport_errors = client_dropped = 0
+    offered = 0
+    mix_size = readers + writers
+    started = time.monotonic()
+    deadline = started + duration
+
+    def collect(done):
+        nonlocal reads, writes, shed, http_errors, transport_errors
+        for future in done:
+            is_writer, status, latency = future.result()
+            latencies.append(latency)
+            if status == 200:
+                if is_writer:
+                    writes += 1
+                else:
+                    reads += 1
+            elif status == 429:
+                shed += 1
+            elif status == 0:
+                transport_errors += 1
+            else:
+                http_errors += 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_outstanding) as executor:
+        while True:
+            now = time.monotonic()
+            done = {future for future in pending if future.done()}
+            pending.difference_update(done)
+            collect(done)
+            expected = min(int((now - started) * rate), int(duration * rate))
+            due = expected - offered
+            for _ in range(max(due, 0)):
+                ordinal = offered
+                offered += 1
+                if len(pending) >= max_outstanding:
+                    client_dropped += 1
+                    continue
+                tenant_index = ordinal % databases
+                role = (ordinal // databases) % mix_size
+                operation = WRITE_POINT if role < writers else read_operation
+                parameter = (
+                    ordinal % ROWS_PER_DATABASE + 1
+                    if operation is WRITE_POINT
+                    else (ordinal % 100 + 1 if operation["rotating_param"] else "%0000%")
+                )
+                pending.add(
+                    executor.submit(
+                        fixed_rate_request,
+                        local,
+                        host,
+                        port,
+                        f"tenant{tenant_index:03d}",
+                        operation,
+                        parameter,
+                    )
+                )
+            if now >= deadline:
+                break
+            time.sleep(0.001)
+
+        for future in concurrent.futures.as_completed(pending):
+            collect([future])
+
+    return {
+        "reads": reads,
+        "writes": writes,
+        "errors": http_errors + transport_errors,
+        "shed_429": shed,
+        "client_dropped": client_dropped,
+        "offered": offered,
+        "latencies": latencies,
+    }
+
+
 def percentile(values, fraction):
     if not values:
         return 0.0
@@ -265,6 +372,11 @@ def run_scenario(index, scenario, duration):
             "TINKIVA_MAX_OPEN_DATABASES": str(databases),
             "TINKIVA_READER_CONNECTIONS": str(reader_pool),
             "TINKIVA_MAX_RESULT_ROWS": "1000",
+            "TINKIVA_MAX_CONCURRENT_REQUESTS_PER_DATABASE": str(
+                scenario.get("per_database_limit", 8)
+            ),
+            "TINKIVA_MAX_CONCURRENT_REQUESTS": str(scenario.get("process_limit", 512)),
+            "TINKIVA_ADMISSION_TIMEOUT_MS": str(scenario.get("admission_timeout_ms", 250)),
             "RUST_LOG": "error",
         }
     )
@@ -284,36 +396,61 @@ def run_scenario(index, scenario, duration):
         after_setup = memory(proc)
 
         users_per_db = readers + writers
-        start = threading.Event()
-        stop_at = [0.0]
-        futures = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=databases * users_per_db) as executor:
-            for i in range(databases):
-                tenant = f"tenant{i:03d}"
-                for _ in range(writers):
-                    futures.append(
-                        executor.submit(worker, host, port, tenant, WRITE_POINT, start, stop_at)
-                    )
-                for _ in range(readers):
-                    futures.append(
-                        executor.submit(worker, host, port, tenant, read_operation, start, stop_at)
-                    )
-            server_cpu_before = cpu_seconds(proc)
-            client_cpu_before = time.process_time()
-            wall_before = time.monotonic()
-            stop_at[0] = wall_before + duration
-            start.set()
-            results = [future.result() for future in futures]
-            wall = time.monotonic() - wall_before
-            server_cpu = cpu_seconds(proc) - server_cpu_before
-            client_cpu = time.process_time() - client_cpu_before
+        server_cpu_before = cpu_seconds(proc)
+        client_cpu_before = time.process_time()
+        wall_before = time.monotonic()
+        if "rate" in scenario:
+            load = fixed_rate_load(
+                host,
+                port,
+                databases,
+                readers,
+                writers,
+                read_operation,
+                scenario["rate"],
+                duration,
+                scenario.get("max_outstanding", 512),
+            )
+            reads = load["reads"]
+            writes = load["writes"]
+            errors = load["errors"]
+            latencies = load["latencies"]
+            offered = load["offered"]
+            shed = load["shed_429"]
+            client_dropped = load["client_dropped"]
+        else:
+            start = threading.Event()
+            stop_at = [0.0]
+            futures = []
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=databases * users_per_db
+            ) as executor:
+                for i in range(databases):
+                    tenant = f"tenant{i:03d}"
+                    for _ in range(writers):
+                        futures.append(
+                            executor.submit(worker, host, port, tenant, WRITE_POINT, start, stop_at)
+                        )
+                    for _ in range(readers):
+                        futures.append(
+                            executor.submit(worker, host, port, tenant, read_operation, start, stop_at)
+                        )
+                stop_at[0] = wall_before + duration
+                start.set()
+                results = [future.result() for future in futures]
+            reads = sum(ops for is_writer, ops, _, _ in results if not is_writer)
+            writes = sum(ops for is_writer, ops, _, _ in results if is_writer)
+            errors = sum(errors for _, _, errors, _ in results)
+            latencies = [latency for _, _, _, values in results for latency in values]
+            offered = reads + writes + errors
+            shed = 0
+            client_dropped = 0
+        wall = time.monotonic() - wall_before
+        server_cpu = cpu_seconds(proc) - server_cpu_before
+        client_cpu = time.process_time() - client_cpu_before
 
         final_memory = memory(proc)
         stats = request(base_url, "/v1/admin/stats")
-        reads = sum(ops for is_writer, ops, _, _ in results if not is_writer)
-        writes = sum(ops for is_writer, ops, _, _ in results if is_writer)
-        errors = sum(errors for _, _, errors, _ in results)
-        latencies = [latency for _, _, _, values in results for latency in values]
         return {
             "scenario": scenario["name"],
             "databases": databases,
@@ -331,7 +468,11 @@ def run_scenario(index, scenario, duration):
             "wal_mb": round(wal_bytes(data_dir) / MB, 2),
             "reads": reads,
             "writes": writes,
-            "rps": round((reads + writes) / wall, 1),
+            "rps": round((reads + writes) / duration, 1),
+            "offered": offered,
+            "sent": offered - client_dropped,
+            "shed_429": shed,
+            "client_dropped": client_dropped,
             "latency_p50_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
             "latency_p95_ms": round(percentile(latencies, 0.95), 2),
             "latency_p99_ms": round(percentile(latencies, 0.99), 2),
@@ -365,6 +506,66 @@ SCENARIOS = [
         "readers": 4,
         "writers": 1,
         "read": READ_SCAN,
+    },
+    {
+        "name": "20db-openloop-2000",
+        "databases": 20,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 1,
+        "rate": 2_000,
+        "max_outstanding": 512,
+        "per_database_limit": 8,
+        "process_limit": 256,
+        "admission_timeout_ms": 20,
+    },
+    {
+        "name": "20db-openloop-4000",
+        "databases": 20,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 1,
+        "rate": 4_000,
+        "max_outstanding": 512,
+        "per_database_limit": 8,
+        "process_limit": 256,
+        "admission_timeout_ms": 20,
+    },
+    {
+        "name": "20db-openloop-4000-wait250",
+        "databases": 20,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 1,
+        "rate": 4_000,
+        "max_outstanding": 512,
+        "per_database_limit": 8,
+        "process_limit": 256,
+        "admission_timeout_ms": 250,
+    },
+    {
+        "name": "20db-openloop-4000-wait50",
+        "databases": 20,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 1,
+        "rate": 4_000,
+        "max_outstanding": 512,
+        "per_database_limit": 8,
+        "process_limit": 256,
+        "admission_timeout_ms": 50,
+    },
+    {
+        "name": "20db-openloop-8000",
+        "databases": 20,
+        "reader_pool": 1,
+        "readers": 4,
+        "writers": 1,
+        "rate": 8_000,
+        "max_outstanding": 512,
+        "per_database_limit": 8,
+        "process_limit": 256,
+        "admission_timeout_ms": 20,
     },
 ]
 
