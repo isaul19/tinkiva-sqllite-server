@@ -154,6 +154,10 @@ impl Settings {
             &mut self.database.max_concurrent_requests,
         )?;
         set_number("TINKIVA_MMAP_SIZE_MB", &mut self.database.mmap_size_mb)?;
+        set_number(
+            "TINKIVA_WAL_SIZE_LIMIT_MB",
+            &mut self.database.wal_size_limit_mb,
+        )?;
         Ok(())
     }
 

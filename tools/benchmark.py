@@ -20,8 +20,15 @@ import time
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target" / "release" / (
-    "tinkiva-database.exe" if os.name == "nt" else "tinkiva-database"
+# Overridable so the same harness can drive an older build: comparing two
+# binaries under one client is the only way to attribute a change.
+BINARY = pathlib.Path(
+    os.environ.get(
+        "TINKIVA_BENCH_BINARY",
+        ROOT / "target" / "release" / (
+            "tinkiva-database.exe" if os.name == "nt" else "tinkiva-database"
+        ),
+    )
 )
 TOKEN = "benchmark-only"
 ROWS_PER_DATABASE = 10_000
