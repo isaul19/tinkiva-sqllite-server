@@ -27,8 +27,10 @@ max_concurrent_requests = 512
 max_concurrent_requests_per_database = 8
 admission_timeout_ms = 250
 
-# Page cache per connection: the main dial for resident memory per tenant.
-cache_size_kb = 2000
+# The writer touches fewer pages than result-producing readers. Separate
+# budgets avoid paying the full reader cache twice for every hot tenant.
+writer_cache_size_kb = 1024
+reader_cache_size_kb = 512
 
 # Mapped bytes per connection; file-backed and evictable, unlike page cache.
 mmap_size_mb = 64

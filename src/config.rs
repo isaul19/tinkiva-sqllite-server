@@ -66,9 +66,13 @@ pub struct DatabaseSettings {
     pub max_concurrent_requests_per_database: usize,
     /// How long a request waits for an admission slot before it is shed.
     pub admission_timeout_ms: u64,
-    /// SQLite page cache per connection. Multiplied by the connections of
-    /// every hot database, this is the dial that sets resident memory.
-    pub cache_size_kb: u32,
+    /// Legacy shared cache override. When present it takes precedence over
+    /// both role-specific budgets so existing configuration keeps its meaning.
+    pub cache_size_kb: Option<u32>,
+    /// SQLite page cache for the single writer connection.
+    pub writer_cache_size_kb: u32,
+    /// SQLite page cache for each reader connection.
+    pub reader_cache_size_kb: u32,
     /// Bytes mapped per connection. Mapped pages are file-backed and
     /// evictable, so they cost far less than private page cache.
     pub mmap_size_mb: u64,
@@ -91,7 +95,9 @@ impl Default for DatabaseSettings {
             max_concurrent_requests: 512,
             max_concurrent_requests_per_database: 8,
             admission_timeout_ms: 250,
-            cache_size_kb: 2_000,
+            cache_size_kb: None,
+            writer_cache_size_kb: 1_024,
+            reader_cache_size_kb: 512,
             mmap_size_mb: 64,
             wal_size_limit_mb: 16,
         }
@@ -110,6 +116,12 @@ impl DatabaseSettings {
     }
     pub fn admission_timeout(&self) -> Duration {
         Duration::from_millis(self.admission_timeout_ms)
+    }
+    pub fn writer_cache_size_kb(&self) -> u32 {
+        self.cache_size_kb.unwrap_or(self.writer_cache_size_kb)
+    }
+    pub fn reader_cache_size_kb(&self) -> u32 {
+        self.cache_size_kb.unwrap_or(self.reader_cache_size_kb)
     }
 }
 
@@ -148,7 +160,21 @@ impl Settings {
             "TINKIVA_MAX_RESULT_ROWS",
             &mut self.database.max_result_rows,
         )?;
-        set_number("TINKIVA_CACHE_SIZE_KB", &mut self.database.cache_size_kb)?;
+        if let Ok(value) = std::env::var("TINKIVA_CACHE_SIZE_KB") {
+            self.database.cache_size_kb = Some(
+                value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("invalid TINKIVA_CACHE_SIZE_KB: {error}"))?,
+            );
+        }
+        set_number(
+            "TINKIVA_WRITER_CACHE_SIZE_KB",
+            &mut self.database.writer_cache_size_kb,
+        )?;
+        set_number(
+            "TINKIVA_READER_CACHE_SIZE_KB",
+            &mut self.database.reader_cache_size_kb,
+        )?;
         set_number(
             "TINKIVA_MAX_CONCURRENT_REQUESTS",
             &mut self.database.max_concurrent_requests,
@@ -174,8 +200,14 @@ impl Settings {
         if self.database.checkpoint_interval_seconds == 0 {
             bail!("checkpoint_interval_seconds must be greater than zero");
         }
-        if self.database.cache_size_kb == 0 {
-            bail!("cache_size_kb must be greater than zero");
+        if self.database.cache_size_kb == Some(0) {
+            bail!("cache_size_kb must be greater than zero when set");
+        }
+        if self.database.writer_cache_size_kb == 0 {
+            bail!("writer_cache_size_kb must be greater than zero");
+        }
+        if self.database.reader_cache_size_kb == 0 {
+            bail!("reader_cache_size_kb must be greater than zero");
         }
         if self.database.max_concurrent_requests == 0 {
             bail!("max_concurrent_requests must be greater than zero");

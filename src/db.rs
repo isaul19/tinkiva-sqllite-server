@@ -359,9 +359,6 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_millis(settings.busy_timeout_ms))
-        // Negative cache_size is KiB rather than pages, so the budget does not
-        // silently change with page_size.
-        .pragma("cache_size", format!("-{}", settings.cache_size_kb))
         .pragma(
             "mmap_size",
             (settings.mmap_size_mb * BYTES_PER_MB).to_string(),
@@ -377,6 +374,13 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
     let wal_limit_bytes = settings.wal_size_limit_mb * BYTES_PER_MB;
     let writer_options = shared
         .clone()
+        // Negative cache_size is KiB rather than pages. Point writes need a
+        // smaller working set than result-producing reads, so do not make every
+        // hot tenant pay the reader budget twice.
+        .pragma(
+            "cache_size",
+            format!("-{}", settings.writer_cache_size_kb()),
+        )
         .pragma(
             "wal_autocheckpoint",
             (wal_limit_bytes / DEFAULT_PAGE_SIZE).to_string(),
@@ -398,7 +402,14 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
     let readers = SqlitePoolOptions::new()
         .max_connections(settings.reader_connections)
         .acquire_timeout(acquire_timeout)
-        .connect_lazy_with(shared.pragma("query_only", "ON"));
+        .connect_lazy_with(
+            shared
+                .pragma(
+                    "cache_size",
+                    format!("-{}", settings.reader_cache_size_kb()),
+                )
+                .pragma("query_only", "ON"),
+        );
 
     Ok(Pools { writer, readers })
 }
@@ -597,6 +608,31 @@ mod tests {
                 .await
                 .is_ok()
         );
+        manager.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn applies_role_specific_page_cache_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            writer_cache_size_kb: 384,
+            reader_cache_size_kb: 768,
+            ..Default::default()
+        };
+        let manager = DatabaseManager::new(settings).await.unwrap();
+        let lease = manager.acquire("tenant").await.unwrap();
+        let writer_cache: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(lease.writer())
+            .await
+            .unwrap();
+        let reader_cache: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(lease.readers())
+            .await
+            .unwrap();
+        assert_eq!(writer_cache, -384);
+        assert_eq!(reader_cache, -768);
+        drop(lease);
         manager.close_all().await;
     }
 

@@ -103,8 +103,10 @@ Con 50 bases abiertas y 2 lectores por base, el techo es aproximadamente 150 con
 driver de sqlx dedica un hilo del sistema operativo a cada conexión, así que ese número también es
 el techo de hilos: es el límite estructural al escalar hacia miles de tenants calientes.
 
-La memoria residente por base caliente es aproximadamente `conexiones × cache_size_kb`. La ventana
-`mmap_size_mb` no cuenta como memoria privada: son páginas del archivo, compartidas y desalojables.
+La memoria residente por base caliente es aproximadamente
+`writer_cache_size_kb + lectores × reader_cache_size_kb`. Separar los presupuestos evita duplicar un
+caché grande en todos los roles. La ventana `mmap_size_mb` no cuenta como memoria privada: son páginas
+del archivo, compartidas y desalojables.
 Puede haber miles de archivos dormidos sin crear miles de pools. El número apropiado depende de la
 RAM, el patrón de consultas, el page cache y la latencia del volumen.
 
