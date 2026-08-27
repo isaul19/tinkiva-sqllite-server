@@ -84,7 +84,7 @@ impl Default for DatabaseSettings {
             idle_timeout_seconds: 300,
             cleanup_interval_seconds: 30,
             checkpoint_interval_seconds: 10,
-            reader_connections: 2,
+            reader_connections: 1,
             busy_timeout_ms: 5_000,
             acquire_timeout_seconds: 10,
             max_result_rows: 10_000,
