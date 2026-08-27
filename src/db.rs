@@ -23,6 +23,9 @@ const MAX_ATTEMPTS: usize = 16;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
+/// SQLite's default page size, used to express the WAL ceiling in pages.
+const DEFAULT_PAGE_SIZE: u64 = 4096;
+
 pub struct DatabaseManager {
     settings: DatabaseSettings,
     entries: DashMap<String, Arc<DatabaseEntry>>,
@@ -366,13 +369,19 @@ async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools,
         .pragma("temp_store", "MEMORY");
     let acquire_timeout = Duration::from_secs(settings.acquire_timeout_seconds);
 
-    // Autocheckpoint is off: with it on, whichever request happens to cross the
-    // WAL threshold pays for the checkpoint of every other request before it.
-    // The background task does that work instead.
-    let writer_options = shared.clone().pragma("wal_autocheckpoint", "0").pragma(
-        "journal_size_limit",
-        (settings.wal_size_limit_mb * BYTES_PER_MB).to_string(),
-    );
+    // The background task does the routine checkpointing, so autocheckpoint is
+    // raised from SQLite's 1000 pages to the configured WAL ceiling rather than
+    // switched off. Off entirely leaves the WAL unbounded whenever writes
+    // outrun the timer, which a write-heavy run reaches within seconds; this
+    // way a request only ever checkpoints as the last line of defence.
+    let wal_limit_bytes = settings.wal_size_limit_mb * BYTES_PER_MB;
+    let writer_options = shared
+        .clone()
+        .pragma(
+            "wal_autocheckpoint",
+            (wal_limit_bytes / DEFAULT_PAGE_SIZE).to_string(),
+        )
+        .pragma("journal_size_limit", wal_limit_bytes.to_string());
 
     // The writer is established eagerly: it creates the file, and paying for it
     // here keeps the cost inside the cold start instead of the first request.
@@ -578,7 +587,7 @@ mod tests {
         }
         let wal = dir.path().join("tenant.db-wal");
         let before = std::fs::metadata(&wal).unwrap().len();
-        assert!(before > 0, "autocheckpoint should be off, leaving a WAL");
+        assert!(before > 0, "writes well under the ceiling stay in the WAL");
         drop(lease);
         assert_eq!(manager.checkpoint_wal().await, 1);
         assert!(std::fs::metadata(&wal).unwrap().len() <= before);
