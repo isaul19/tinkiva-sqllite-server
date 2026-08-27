@@ -332,4 +332,61 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(allowed).await.unwrap().status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn rolls_back_a_failed_batch() {
+        let (app, _dir) = test_app(None).await;
+        let create = Request::post("/v1/db/acme/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER CHECK(amount > 0))"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(create).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let batch = Request::post("/v1/db/acme/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"statements":[{"sql":"INSERT INTO ledger(amount) VALUES (?)","params":[10]},{"sql":"INSERT INTO ledger(amount) VALUES (?)","params":[-1]}]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(batch).await.unwrap().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let count = Request::post("/v1/db/acme/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"SELECT count(*) AS total FROM ledger"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(count).await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["rows"][0]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn keeps_tenant_files_isolated() {
+        let (app, dir) = test_app(None).await;
+        for tenant in ["alpha", "beta"] {
+            let request = Request::post(format!("/v1/db/{tenant}/execute"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"sql":"CREATE TABLE identity (tenant TEXT)"}"#,
+                ))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        assert!(dir.path().join("alpha.db").exists());
+        assert!(dir.path().join("beta.db").exists());
+    }
 }

@@ -214,4 +214,39 @@ mod tests {
         assert!(dir.path().join("second.db").exists());
         manager.close_all().await;
     }
+
+    #[tokio::test]
+    async fn refuses_eviction_while_the_only_database_is_leased() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            max_open_databases: 1,
+            ..Default::default()
+        };
+        let manager = DatabaseManager::new(settings).await.unwrap();
+        let active = manager.acquire("active").await.unwrap();
+        assert!(matches!(
+            manager.acquire("another").await,
+            Err(AppError::CapacityBusy)
+        ));
+        drop(active);
+        assert!(manager.acquire("another").await.is_ok());
+        manager.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_active_leases_and_closes_idle_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            idle_timeout_seconds: 0,
+            ..Default::default()
+        };
+        let manager = DatabaseManager::new(settings).await.unwrap();
+        let active = manager.acquire("tenant").await.unwrap();
+        assert_eq!(manager.cleanup_idle().await.unwrap(), 0);
+        drop(active);
+        assert_eq!(manager.cleanup_idle().await.unwrap(), 1);
+        assert_eq!(manager.stats().await.open_databases, 0);
+    }
 }
