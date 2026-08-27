@@ -1,5 +1,15 @@
+"""Reproducible load generator for TinkivaDatabase.
+
+The client keeps one persistent HTTP connection per worker so the measurement
+reflects server cost instead of TCP handshakes, and it reports the CPU time of
+both processes: when the client is the saturated one, the throughput number
+describes the generator, not the service.
+"""
+
+import argparse
 import concurrent.futures
 import ctypes
+import http.client
 import json
 import os
 import pathlib
@@ -15,6 +25,7 @@ BINARY = ROOT / "target" / "release" / (
 )
 TOKEN = "benchmark-only"
 ROWS_PER_DATABASE = 10_000
+MB = 1024 * 1024
 
 
 class ProcessMemoryCounters(ctypes.Structure):
@@ -30,6 +41,13 @@ class ProcessMemoryCounters(ctypes.Structure):
         ("PagefileUsage", ctypes.c_size_t),
         ("PeakPagefileUsage", ctypes.c_size_t),
     ]
+
+
+class FileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+    def seconds(self):
+        return ((self.high << 32) | self.low) / 1e7
 
 
 def memory(proc):
@@ -54,13 +72,80 @@ def memory(proc):
     )
     if not ok:
         raise ctypes.WinError()
-    mb = 1024 * 1024
     return {
-        "working_mb": counters.WorkingSetSize / mb,
-        "peak_working_mb": counters.PeakWorkingSetSize / mb,
-        "private_mb": counters.PagefileUsage / mb,
-        "peak_private_mb": counters.PeakPagefileUsage / mb,
+        "working_mb": counters.WorkingSetSize / MB,
+        "peak_working_mb": counters.PeakWorkingSetSize / MB,
+        "private_mb": counters.PagefileUsage / MB,
+        "peak_private_mb": counters.PeakPagefileUsage / MB,
     }
+
+
+def cpu_seconds(proc):
+    """Total user+system CPU seconds consumed by the server process so far."""
+    if os.name != "nt":
+        with open(f"/proc/{proc.pid}/stat", encoding="utf-8") as stat:
+            fields = stat.read().rsplit(") ", 1)[1].split()
+        ticks = os.sysconf("SC_CLK_TCK")
+        return (int(fields[11]) + int(fields[12])) / ticks
+
+    creation, exit_time, kernel, user = FileTime(), FileTime(), FileTime(), FileTime()
+    ok = ctypes.windll.kernel32.GetProcessTimes(
+        int(proc._handle),
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    return kernel.seconds() + user.seconds()
+
+
+def wal_bytes(data_dir):
+    return sum(path.stat().st_size for path in pathlib.Path(data_dir).glob("*.db-wal"))
+
+
+class Client:
+    """One keep-alive connection, reused for every request of a worker."""
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.connection = None
+
+    def connect(self):
+        self.connection = http.client.HTTPConnection(self.host, self.port, timeout=30)
+
+    def post(self, path, body):
+        payload = json.dumps(body)
+        for attempt in range(2):
+            if self.connection is None:
+                self.connect()
+            try:
+                self.connection.request(
+                    "POST",
+                    path,
+                    payload,
+                    {
+                        "Authorization": f"Bearer {TOKEN}",
+                        "Content-Type": "application/json",
+                        "Connection": "keep-alive",
+                    },
+                )
+                response = self.connection.getresponse()
+                data = response.read()
+                if response.status >= 400:
+                    raise RuntimeError(f"HTTP {response.status}")
+                return data
+            except (http.client.HTTPException, OSError):
+                self.close()
+                if attempt == 1:
+                    raise
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
 
 
 def request(base_url, path, body=None):
@@ -71,12 +156,12 @@ def request(base_url, path, body=None):
         headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
         method="GET" if body is None else "POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=60) as response:
         return json.loads(response.read())
 
 
 def wait_until_ready(base_url):
-    for _ in range(100):
+    for _ in range(200):
         try:
             with urllib.request.urlopen(base_url + "/health", timeout=1) as response:
                 if response.status == 200:
@@ -100,38 +185,51 @@ def initialize_database(base_url, tenant):
     request(base_url, f"/v1/db/{tenant}/batch", {"statements": statements})
 
 
-def worker(base_url, tenant, writer, start, stop_at):
-    local_latencies = []
+READ_INDEXED = {
+    "sql": "SELECT id, payload, counter FROM items WHERE category = ? ORDER BY id LIMIT 100",
+    "rotating_param": True,
+}
+READ_SCAN = {
+    "sql": "SELECT count(*) AS total, sum(counter) AS clicks FROM items WHERE payload LIKE ?",
+    "rotating_param": False,
+}
+WRITE_POINT = {
+    "sql": "UPDATE items SET counter = counter + 1 WHERE id = ?",
+    "rotating_param": True,
+}
+
+
+def worker(host, port, tenant, operation, start, stop_at):
+    latencies = []
     operations = 0
     errors = 0
-    row_id = 1
-    category = 0
+    cursor = 1
+    client = Client(host, port)
+    client.connect()
     start.wait()
-    while time.monotonic() < stop_at[0]:
-        before = time.perf_counter()
-        try:
-            if writer:
-                request(
-                    base_url,
-                    f"/v1/db/{tenant}/execute",
-                    {"sql": "UPDATE items SET counter = counter + 1 WHERE id = ?", "params": [row_id]},
-                )
-                row_id = row_id % ROWS_PER_DATABASE + 1
+    try:
+        while time.monotonic() < stop_at[0]:
+            if operation is WRITE_POINT:
+                path = f"/v1/db/{tenant}/execute"
+                param = cursor
+                cursor = cursor % ROWS_PER_DATABASE + 1
             else:
-                request(
-                    base_url,
-                    f"/v1/db/{tenant}/query",
-                    {
-                        "sql": "SELECT id, payload, counter FROM items WHERE category = ? ORDER BY id LIMIT 100",
-                        "params": [category],
-                    },
-                )
-                category = (category + 1) % 100
-            operations += 1
-            local_latencies.append((time.perf_counter() - before) * 1000)
-        except Exception:
-            errors += 1
-    return writer, operations, errors, local_latencies
+                path = f"/v1/db/{tenant}/query"
+                if operation["rotating_param"]:
+                    param = cursor
+                    cursor = cursor % 100 + 1
+                else:
+                    param = "%0000%"
+            before = time.perf_counter()
+            try:
+                client.post(path, {"sql": operation["sql"], "params": [param]})
+                operations += 1
+                latencies.append((time.perf_counter() - before) * 1000)
+            except Exception:
+                errors += 1
+    finally:
+        client.close()
+    return operation is WRITE_POINT, operations, errors, latencies
 
 
 def percentile(values, fraction):
@@ -141,14 +239,20 @@ def percentile(values, fraction):
     return values[min(len(values) - 1, int(len(values) * fraction))]
 
 
-def run_scenario(index, databases, connections, duration=8):
+def run_scenario(index, scenario, duration):
+    databases = scenario["databases"]
+    connections = scenario["connections"]
+    readers = scenario["readers"]
+    writers = scenario["writers"]
+    read_operation = scenario.get("read", READ_INDEXED)
+    host = "127.0.0.1"
     port = 17100 + index
-    base_url = f"http://127.0.0.1:{port}"
-    data_dir = ROOT / "data" / f"run-{index}-{databases}db-{connections}conn"
+    base_url = f"http://{host}:{port}"
+    data_dir = ROOT / "data" / ("run-" + scenario["name"])
     env = os.environ.copy()
     env.update(
         {
-            "TINKIVA_BIND": f"127.0.0.1:{port}",
+            "TINKIVA_BIND": f"{host}:{port}",
             "TINKIVA_AUTH_TOKEN": TOKEN,
             "TINKIVA_DATABASE_DIR": str(data_dir),
             "TINKIVA_MAX_OPEN_DATABASES": str(databases),
@@ -172,53 +276,113 @@ def run_scenario(index, databases, connections, duration=8):
             list(executor.map(lambda i: initialize_database(base_url, f"tenant{i:03d}"), range(databases)))
         after_setup = memory(proc)
 
+        users_per_db = readers + writers
         start = threading.Event()
         stop_at = [0.0]
         futures = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=databases * 5) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=databases * users_per_db) as executor:
             for i in range(databases):
                 tenant = f"tenant{i:03d}"
-                futures.append(executor.submit(worker, base_url, tenant, True, start, stop_at))
-                for _ in range(4):
-                    futures.append(executor.submit(worker, base_url, tenant, False, start, stop_at))
-            stop_at[0] = time.monotonic() + duration
+                for _ in range(writers):
+                    futures.append(
+                        executor.submit(worker, host, port, tenant, WRITE_POINT, start, stop_at)
+                    )
+                for _ in range(readers):
+                    futures.append(
+                        executor.submit(worker, host, port, tenant, read_operation, start, stop_at)
+                    )
+            server_cpu_before = cpu_seconds(proc)
+            client_cpu_before = time.process_time()
+            wall_before = time.monotonic()
+            stop_at[0] = wall_before + duration
             start.set()
             results = [future.result() for future in futures]
+            wall = time.monotonic() - wall_before
+            server_cpu = cpu_seconds(proc) - server_cpu_before
+            client_cpu = time.process_time() - client_cpu_before
 
         final_memory = memory(proc)
         stats = request(base_url, "/v1/admin/stats")
-        reads = sum(ops for writer, ops, _, _ in results if not writer)
-        writes = sum(ops for writer, ops, _, _ in results if writer)
+        reads = sum(ops for is_writer, ops, _, _ in results if not is_writer)
+        writes = sum(ops for is_writer, ops, _, _ in results if is_writer)
         errors = sum(errors for _, _, errors, _ in results)
         latencies = [latency for _, _, _, values in results for latency in values]
         return {
+            "scenario": scenario["name"],
             "databases": databases,
             "connections_per_db": connections,
-            "users": databases * 5,
+            "users": databases * users_per_db,
+            "readers_per_db": readers,
+            "writers_per_db": writers,
             "rows_per_db": ROWS_PER_DATABASE,
+            "duration_s": round(wall, 2),
             "baseline_mb": round(baseline["working_mb"], 2),
             "after_setup_mb": round(after_setup["working_mb"], 2),
             "final_mb": round(final_memory["working_mb"], 2),
             "peak_mb": round(final_memory["peak_working_mb"], 2),
             "private_mb": round(final_memory["private_mb"], 2),
+            "wal_mb": round(wal_bytes(data_dir) / MB, 2),
             "reads": reads,
             "writes": writes,
-            "rps": round((reads + writes) / duration, 1),
-            "latency_p50_ms": round(statistics.median(latencies), 2),
+            "rps": round((reads + writes) / wall, 1),
+            "latency_p50_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
             "latency_p95_ms": round(percentile(latencies, 0.95), 2),
+            "latency_p99_ms": round(percentile(latencies, 0.99), 2),
+            "server_cpu_cores": round(server_cpu / wall, 2),
+            "client_cpu_cores": round(client_cpu / wall, 2),
+            "cpu_ms_per_op": round(server_cpu * 1000 / max(reads + writes, 1), 3),
             "errors": errors,
             "open_databases": stats["open_databases"],
         }
     finally:
         proc.terminate()
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
 
 
+SCENARIOS = [
+    {"name": "1db-pool1", "databases": 1, "connections": 1, "readers": 4, "writers": 1},
+    {"name": "1db-pool2", "databases": 1, "connections": 2, "readers": 4, "writers": 1},
+    {"name": "1db-pool5", "databases": 1, "connections": 5, "readers": 4, "writers": 1},
+    {"name": "5db-pool2", "databases": 5, "connections": 2, "readers": 4, "writers": 1},
+    {"name": "20db-pool2", "databases": 20, "connections": 2, "readers": 4, "writers": 1},
+    {"name": "50db-pool1", "databases": 50, "connections": 1, "readers": 4, "writers": 1},
+    {"name": "50db-pool2", "databases": 50, "connections": 2, "readers": 4, "writers": 1},
+    {"name": "20db-writeheavy", "databases": 20, "connections": 2, "readers": 1, "writers": 4},
+    {
+        "name": "20db-scan",
+        "databases": 20,
+        "connections": 2,
+        "readers": 4,
+        "writers": 1,
+        "read": READ_SCAN,
+    },
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=int(os.environ.get("BENCH_DURATION", "60")),
+        help="seconds of load per scenario; short runs never reach a WAL checkpoint",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        help="run only the named scenario; repeatable",
+    )
+    arguments = parser.parse_args()
+    if not BINARY.exists():
+        raise SystemExit(f"missing {BINARY}: run `cargo build --release` first")
+    for index, scenario in enumerate(SCENARIOS):
+        if arguments.only and scenario["name"] not in arguments.only:
+            continue
+        print(json.dumps(run_scenario(index, scenario, arguments.duration)), flush=True)
+
+
 if __name__ == "__main__":
-    scenarios = [(1, 2), (1, 5), (5, 2), (20, 2), (50, 2)]
-    for index, (databases, connections) in enumerate(scenarios):
-        result = run_scenario(index, databases, connections)
-        print(json.dumps(result), flush=True)
+    main()
