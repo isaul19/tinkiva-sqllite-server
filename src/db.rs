@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     ops::Deref,
     path::PathBuf,
     sync::{
@@ -10,19 +9,31 @@ use std::{
 };
 
 use crate::{config::DatabaseSettings, error::AppError};
+use dashmap::DashMap;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
+
+/// Lease count reserved for an entry that is closing and must never be handed out again.
+const CLOSED: usize = usize::MAX;
+
+/// Bound on how many times a caller retries around a concurrent eviction.
+const MAX_ATTEMPTS: usize = 16;
 
 pub struct DatabaseManager {
     settings: DatabaseSettings,
-    entries: Mutex<HashMap<String, Arc<DatabaseEntry>>>,
+    entries: DashMap<String, Arc<DatabaseEntry>>,
+    /// Serializes admission of *new* tenants so capacity stays exact. It is
+    /// never held across opening a database, so a cold start only blocks other
+    /// cold starts, not requests to databases that are already open.
+    admission: Mutex<()>,
 }
+
 pub struct DatabaseEntry {
     name: String,
-    pool: SqlitePool,
+    pool: OnceCell<SqlitePool>,
     last_used_ms: AtomicU64,
     active_leases: AtomicUsize,
 }
@@ -40,99 +51,134 @@ impl DatabaseManager {
         tokio::fs::create_dir_all(&settings.directory).await?;
         Ok(Self {
             settings,
-            entries: Mutex::new(HashMap::new()),
+            entries: DashMap::new(),
+            admission: Mutex::new(()),
         })
     }
 
     pub async fn acquire(&self, name: &str) -> Result<DatabaseLease, AppError> {
         validate_database_name(name)?;
-        let mut entries = self.entries.lock().await;
-        if let Some(entry) = entries.get(name) {
-            entry.active_leases.fetch_add(1, Ordering::AcqRel);
-            entry.touch();
-            return Ok(DatabaseLease(entry.clone()));
+        for _ in 0..MAX_ATTEMPTS {
+            let entry = self.slot(name).await?;
+            if !entry.lease() {
+                // The entry started closing between the lookup and the lease;
+                // give the closer a chance to remove it, then look again.
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let lease = DatabaseLease(entry);
+            lease.0.ensure_open(&self.settings, self.database_path(name))
+                .await
+                .inspect_err(|_| {
+                    self.entries.remove_if(name, |_, entry| Arc::ptr_eq(entry, &lease.0));
+                })?;
+            lease.0.touch();
+            return Ok(lease);
         }
-        let evicted = if entries.len() >= self.settings.max_open_databases {
-            let candidate = entries
-                .iter()
-                .filter(|(_, entry)| entry.active_leases.load(Ordering::Acquire) == 0)
-                .min_by_key(|(_, entry)| entry.last_used_ms.load(Ordering::Acquire))
-                .map(|(name, _)| name.clone())
-                .ok_or(AppError::CapacityBusy)?;
-            entries.remove(&candidate)
-        } else {
-            None
-        };
-        let entry = Arc::new(self.open(name).await?);
-        entry.active_leases.store(1, Ordering::Release);
-        entries.insert(name.to_owned(), entry.clone());
-        drop(entries);
-        if let Some(evicted) = evicted {
-            tokio::spawn(async move {
-                close_entry(evicted).await;
-            });
-        }
-        Ok(DatabaseLease(entry))
+        Err(AppError::CapacityBusy)
     }
 
-    async fn open(&self, name: &str) -> Result<DatabaseEntry, sqlx::Error> {
-        let options = SqliteConnectOptions::new()
-            .filename(self.database_path(name))
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_millis(self.settings.busy_timeout_ms));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(self.settings.connections_per_database)
-            .acquire_timeout(Duration::from_secs(self.settings.acquire_timeout_seconds))
-            .connect_with(options)
-            .await?;
-        Ok(DatabaseEntry {
-            name: name.to_owned(),
-            pool,
-            last_used_ms: AtomicU64::new(now_ms()),
-            active_leases: AtomicUsize::new(0),
-        })
+    /// Returns the entry for `name`, admitting a new one when the database is
+    /// not resident yet. The returned entry may still be unopened.
+    async fn slot(&self, name: &str) -> Result<Arc<DatabaseEntry>, AppError> {
+        if let Some(entry) = self.entries.get(name) {
+            return Ok(entry.value().clone());
+        }
+        let _admission = self.admission.lock().await;
+        if let Some(entry) = self.entries.get(name) {
+            return Ok(entry.value().clone());
+        }
+        let mut attempts = 0;
+        while self.entries.len() >= self.settings.max_open_databases {
+            attempts += 1;
+            if attempts > MAX_ATTEMPTS || !self.evict_oldest_idle() {
+                return Err(AppError::CapacityBusy);
+            }
+        }
+        let entry = Arc::new(DatabaseEntry::new(name));
+        self.entries.insert(name.to_owned(), entry.clone());
+        Ok(entry)
+    }
+
+    /// Removes the least recently used entry that nobody is holding. The
+    /// checkpoint runs in the background so the admitted request does not pay
+    /// for the evicted tenant's shutdown.
+    fn evict_oldest_idle(&self) -> bool {
+        let mut candidate: Option<(String, u64)> = None;
+        for entry in self.entries.iter() {
+            if entry.active_leases.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            let last_used = entry.last_used_ms.load(Ordering::Acquire);
+            if candidate
+                .as_ref()
+                .is_none_or(|(_, oldest)| last_used < *oldest)
+            {
+                candidate = Some((entry.key().clone(), last_used));
+            }
+        }
+        let Some((name, _)) = candidate else {
+            return false;
+        };
+        match self.take(&name) {
+            Some(entry) => {
+                tokio::spawn(close_entry(entry));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Marks an entry closed and unlinks it. Fails if it was leased meanwhile.
+    fn take(&self, name: &str) -> Option<Arc<DatabaseEntry>> {
+        let entry = self.entries.get(name)?.value().clone();
+        if !entry.begin_close() {
+            return None;
+        }
+        self.entries.remove(name);
+        Some(entry)
     }
 
     pub async fn cleanup_idle(&self) -> anyhow::Result<usize> {
         let cutoff = now_ms().saturating_sub(self.settings.idle_timeout().as_millis() as u64);
-        let mut entries = self.entries.lock().await;
-        let names: Vec<_> = entries
+        let stale: Vec<_> = self
+            .entries
             .iter()
-            .filter(|(_, entry)| entry.active_leases.load(Ordering::Acquire) == 0)
-            .filter(|(_, entry)| entry.last_used_ms.load(Ordering::Acquire) <= cutoff)
-            .map(|(name, _)| name.clone())
+            .filter(|entry| entry.active_leases.load(Ordering::Acquire) == 0)
+            .filter(|entry| entry.last_used_ms.load(Ordering::Acquire) <= cutoff)
+            .map(|entry| entry.key().clone())
             .collect();
-        let removed: Vec<_> = names
-            .iter()
-            .filter_map(|name| entries.remove(name))
-            .collect();
-        drop(entries);
-        let count = removed.len();
-        for entry in removed {
-            close_entry(entry).await;
+        let mut closed = 0;
+        for name in stale {
+            if let Some(entry) = self.take(&name) {
+                close_entry(entry).await;
+                closed += 1;
+            }
         }
-        Ok(count)
+        Ok(closed)
     }
 
     pub async fn stats(&self) -> ManagerStats {
-        let entries = self.entries.lock().await;
         ManagerStats {
-            open_databases: entries.len(),
-            active_leases: entries
-                .values()
-                .map(|e| e.active_leases.load(Ordering::Acquire))
+            open_databases: self.entries.len(),
+            active_leases: self
+                .entries
+                .iter()
+                .map(|entry| entry.active_leases.load(Ordering::Acquire))
+                .filter(|leases| *leases != CLOSED)
                 .sum(),
             max_open_databases: self.settings.max_open_databases,
         }
     }
     pub async fn close_all(&self) {
-        let mut entries = self.entries.lock().await;
-        let removed: Vec<_> = entries.drain().map(|(_, entry)| entry).collect();
-        drop(entries);
-        for entry in removed {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        self.entries.clear();
+        for entry in entries {
+            entry.begin_close();
             close_entry(entry).await;
         }
     }
@@ -145,14 +191,76 @@ impl DatabaseManager {
 }
 
 impl DatabaseEntry {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            pool: OnceCell::new(),
+            last_used_ms: AtomicU64::new(now_ms()),
+            active_leases: AtomicUsize::new(0),
+        }
+    }
+
+    /// Opens the pool on first use. Concurrent callers for the same database
+    /// wait here; callers for every other database are unaffected.
+    async fn ensure_open(
+        &self,
+        settings: &DatabaseSettings,
+        path: PathBuf,
+    ) -> Result<(), sqlx::Error> {
+        self.pool
+            .get_or_try_init(|| open_pool(settings, path))
+            .await?;
+        Ok(())
+    }
+
+    fn lease(&self) -> bool {
+        let mut current = self.active_leases.load(Ordering::Acquire);
+        loop {
+            if current == CLOSED {
+                return false;
+            }
+            match self.active_leases.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn begin_close(&self) -> bool {
+        self.active_leases
+            .compare_exchange(0, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     fn touch(&self) {
         self.last_used_ms.store(now_ms(), Ordering::Release);
     }
 }
+
+async fn open_pool(settings: &DatabaseSettings, path: PathBuf) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_millis(settings.busy_timeout_ms));
+    SqlitePoolOptions::new()
+        .max_connections(settings.connections_per_database)
+        .acquire_timeout(Duration::from_secs(settings.acquire_timeout_seconds))
+        .connect_with(options)
+        .await
+}
+
 impl Deref for DatabaseLease {
     type Target = SqlitePool;
     fn deref(&self) -> &Self::Target {
-        &self.0.pool
+        self.0.pool.get().expect("a leased entry is always open")
     }
 }
 impl Drop for DatabaseLease {
@@ -162,10 +270,13 @@ impl Drop for DatabaseLease {
     }
 }
 async fn close_entry(entry: Arc<DatabaseEntry>) {
+    let Some(pool) = entry.pool.get() else {
+        return;
+    };
     let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&entry.pool)
+        .execute(pool)
         .await;
-    entry.pool.close().await;
+    pool.close().await;
     tracing::debug!(database = %entry.name, "database returned to sleep");
 }
 fn now_ms() -> u64 {
@@ -248,5 +359,29 @@ mod tests {
         drop(active);
         assert_eq!(manager.cleanup_idle().await.unwrap(), 1);
         assert_eq!(manager.stats().await.open_databases, 0);
+    }
+
+    #[tokio::test]
+    async fn a_slow_cold_start_does_not_block_other_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            ..Default::default()
+        };
+        let manager = Arc::new(DatabaseManager::new(settings).await.unwrap());
+        // Twenty concurrent cold starts must all succeed without serializing
+        // behind a single registry lock.
+        let mut handles = Vec::new();
+        for index in 0..20 {
+            let manager = manager.clone();
+            handles.push(tokio::spawn(async move {
+                manager.acquire(&format!("tenant{index:02}")).await.is_ok()
+            }));
+        }
+        for handle in handles {
+            assert!(handle.await.unwrap());
+        }
+        assert_eq!(manager.stats().await.open_databases, 20);
+        manager.close_all().await;
     }
 }
