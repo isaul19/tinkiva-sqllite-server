@@ -153,8 +153,24 @@ impl Settings {
             &mut self.database.idle_timeout_seconds,
         )?;
         set_number(
+            "TINKIVA_CLEANUP_INTERVAL_SECONDS",
+            &mut self.database.cleanup_interval_seconds,
+        )?;
+        set_number(
+            "TINKIVA_CHECKPOINT_INTERVAL_SECONDS",
+            &mut self.database.checkpoint_interval_seconds,
+        )?;
+        set_number(
             "TINKIVA_READER_CONNECTIONS",
             &mut self.database.reader_connections,
+        )?;
+        set_number(
+            "TINKIVA_BUSY_TIMEOUT_MS",
+            &mut self.database.busy_timeout_ms,
+        )?;
+        set_number(
+            "TINKIVA_ACQUIRE_TIMEOUT_SECONDS",
+            &mut self.database.acquire_timeout_seconds,
         )?;
         set_number(
             "TINKIVA_MAX_RESULT_ROWS",
@@ -178,6 +194,14 @@ impl Settings {
         set_number(
             "TINKIVA_MAX_CONCURRENT_REQUESTS",
             &mut self.database.max_concurrent_requests,
+        )?;
+        set_number(
+            "TINKIVA_MAX_CONCURRENT_REQUESTS_PER_DATABASE",
+            &mut self.database.max_concurrent_requests_per_database,
+        )?;
+        set_number(
+            "TINKIVA_ADMISSION_TIMEOUT_MS",
+            &mut self.database.admission_timeout_ms,
         )?;
         set_number("TINKIVA_MMAP_SIZE_MB", &mut self.database.mmap_size_mb)?;
         set_number(
