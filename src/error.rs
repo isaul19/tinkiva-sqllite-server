@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -12,6 +12,8 @@ pub enum AppError {
     InvalidDatabaseName,
     #[error("all open databases are currently busy")]
     CapacityBusy,
+    #[error("too many concurrent requests; retry shortly")]
+    Overloaded,
     #[error("unauthorized")]
     Unauthorized,
     #[error("invalid request: {0}")]
@@ -39,13 +41,18 @@ impl IntoResponse for AppError {
                 (StatusCode::BAD_REQUEST, "invalid_request")
             }
             Self::CapacityBusy => (StatusCode::SERVICE_UNAVAILABLE, "capacity_busy"),
+            Self::Overloaded => (StatusCode::TOO_MANY_REQUESTS, "overloaded"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Database(sqlx::Error::RowNotFound) => (StatusCode::NOT_FOUND, "not_found"),
             Self::Database(_) => (StatusCode::UNPROCESSABLE_ENTITY, "database_error"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
+        // Shedding is only useful if the caller is told to come back.
+        let retry_after = matches!(self, Self::CapacityBusy | Self::Overloaded)
+            .then_some([(header::RETRY_AFTER, "1")]);
         (
             status,
+            retry_after,
             Json(ErrorBody {
                 error: ErrorDetail {
                     code,

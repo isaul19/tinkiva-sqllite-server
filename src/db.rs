@@ -13,7 +13,7 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 
 /// Lease count reserved for an entry that is closing and must never be handed out again.
 const CLOSED: usize = usize::MAX;
@@ -30,6 +30,9 @@ pub struct DatabaseManager {
     /// never held across opening a database, so a cold start only blocks other
     /// cold starts, not requests to databases that are already open.
     admission: Mutex<()>,
+    /// Caps in-flight work for the whole process. Without it, overload shows up
+    /// as latency spread across every tenant instead of as a clear signal.
+    slots: Arc<Semaphore>,
 }
 
 pub struct DatabaseEntry {
@@ -37,8 +40,15 @@ pub struct DatabaseEntry {
     pools: OnceCell<Pools>,
     last_used_ms: AtomicU64,
     active_leases: AtomicUsize,
+    /// Per-tenant share of the process, so one database saturating its writer
+    /// cannot queue requests on behalf of every other database.
+    slots: Arc<Semaphore>,
 }
-pub struct DatabaseLease(Arc<DatabaseEntry>);
+pub struct DatabaseLease {
+    entry: Arc<DatabaseEntry>,
+    /// Held for the life of the request; dropping it readmits another caller.
+    _slots: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+}
 
 /// SQLite serializes writes to a file no matter how many connections exist, so
 /// one writer is all a database can use. Readers get their own pool and their
@@ -53,12 +63,15 @@ pub struct ManagerStats {
     pub open_databases: usize,
     pub active_leases: usize,
     pub max_open_databases: usize,
+    pub available_request_slots: usize,
+    pub max_concurrent_requests: usize,
 }
 
 impl DatabaseManager {
     pub async fn new(settings: DatabaseSettings) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&settings.directory).await?;
         Ok(Self {
+            slots: Arc::new(Semaphore::new(settings.max_concurrent_requests)),
             settings,
             entries: DashMap::new(),
             admission: Mutex::new(()),
@@ -75,16 +88,46 @@ impl DatabaseManager {
                 tokio::task::yield_now().await;
                 continue;
             }
-            let lease = DatabaseLease(entry);
-            lease.0.ensure_open(&self.settings, self.database_path(name))
+            // Built before admission so that shedding still releases the lease.
+            let mut lease = DatabaseLease {
+                entry,
+                _slots: None,
+            };
+            // The tenant slot is taken before the global one so a saturated
+            // database queues on its own share instead of occupying the
+            // process-wide budget while it waits.
+            let Some(tenant_slot) = self.wait_for_slot(&lease.entry.slots).await else {
+                return Err(AppError::Overloaded);
+            };
+            let Some(process_slot) = self.wait_for_slot(&self.slots).await else {
+                return Err(AppError::Overloaded);
+            };
+            lease._slots = Some((tenant_slot, process_slot));
+            lease
+                .entry
+                .ensure_open(&self.settings, self.database_path(name))
                 .await
                 .inspect_err(|_| {
-                    self.entries.remove_if(name, |_, entry| Arc::ptr_eq(entry, &lease.0));
+                    self.entries
+                        .remove_if(name, |_, entry| Arc::ptr_eq(entry, &lease.entry));
                 })?;
-            lease.0.touch();
+            lease.entry.touch();
             return Ok(lease);
         }
         Err(AppError::CapacityBusy)
+    }
+
+    /// Waits a bounded time for an admission slot. Shedding after
+    /// `admission_timeout` is what turns overload into a 429 the caller can act
+    /// on, instead of a queue that only shows up as p99 latency.
+    async fn wait_for_slot(&self, slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+        tokio::time::timeout(
+            self.settings.admission_timeout(),
+            slots.clone().acquire_owned(),
+        )
+        .await
+        .ok()?
+        .ok()
     }
 
     /// Returns the entry for `name`, admitting a new one when the database is
@@ -104,7 +147,10 @@ impl DatabaseManager {
                 return Err(AppError::CapacityBusy);
             }
         }
-        let entry = Arc::new(DatabaseEntry::new(name));
+        let entry = Arc::new(DatabaseEntry::new(
+            name,
+            self.settings.max_concurrent_requests_per_database,
+        ));
         self.entries.insert(name.to_owned(), entry.clone());
         Ok(entry)
     }
@@ -181,8 +227,13 @@ impl DatabaseManager {
             if !entry.lease() {
                 continue;
             }
-            let lease = DatabaseLease(entry);
-            if lease.0.pools.get().is_none() {
+            // Maintenance deliberately bypasses admission: it must not be
+            // shed by the load it exists to keep bounded.
+            let lease = DatabaseLease {
+                entry,
+                _slots: None,
+            };
+            if lease.entry.pools.get().is_none() {
                 continue;
             }
             match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
@@ -191,7 +242,7 @@ impl DatabaseManager {
             {
                 Ok(_) => checkpointed += 1,
                 Err(error) => {
-                    tracing::warn!(database = %lease.0.name, %error, "wal checkpoint failed");
+                    tracing::warn!(database = %lease.entry.name, %error, "wal checkpoint failed");
                 }
             }
         }
@@ -208,6 +259,8 @@ impl DatabaseManager {
                 .filter(|leases| *leases != CLOSED)
                 .sum(),
             max_open_databases: self.settings.max_open_databases,
+            available_request_slots: self.slots.available_permits(),
+            max_concurrent_requests: self.settings.max_concurrent_requests,
         }
     }
     pub async fn close_all(&self) {
@@ -231,12 +284,13 @@ impl DatabaseManager {
 }
 
 impl DatabaseEntry {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, slots: usize) -> Self {
         Self {
             name: name.to_owned(),
             pools: OnceCell::new(),
             last_used_ms: AtomicU64::new(now_ms()),
             active_leases: AtomicUsize::new(0),
+            slots: Arc::new(Semaphore::new(slots)),
         }
     }
 
@@ -338,13 +392,16 @@ impl DatabaseLease {
         &self.pools().readers
     }
     fn pools(&self) -> &Pools {
-        self.0.pools.get().expect("a leased entry is always open")
+        self.entry
+            .pools
+            .get()
+            .expect("a leased entry is always open")
     }
 }
 impl Drop for DatabaseLease {
     fn drop(&mut self) {
-        self.0.touch();
-        self.0.active_leases.fetch_sub(1, Ordering::AcqRel);
+        self.entry.touch();
+        self.entry.active_leases.fetch_sub(1, Ordering::AcqRel);
     }
 }
 async fn close_entry(entry: Arc<DatabaseEntry>) {
@@ -442,6 +499,49 @@ mod tests {
         drop(active);
         assert_eq!(manager.cleanup_idle().await.unwrap(), 1);
         assert_eq!(manager.stats().await.open_databases, 0);
+    }
+
+    #[tokio::test]
+    async fn sheds_requests_beyond_the_per_database_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            max_concurrent_requests_per_database: 1,
+            admission_timeout_ms: 20,
+            ..Default::default()
+        };
+        let manager = DatabaseManager::new(settings).await.unwrap();
+        let held = manager.acquire("tenant").await.unwrap();
+        assert!(matches!(
+            manager.acquire("tenant").await,
+            Err(AppError::Overloaded)
+        ));
+        // A different database keeps its own share and is unaffected.
+        assert!(manager.acquire("other").await.is_ok());
+        drop(held);
+        assert!(manager.acquire("tenant").await.is_ok());
+        manager.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn sheds_requests_beyond_the_process_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            directory: dir.path().into(),
+            max_concurrent_requests: 1,
+            admission_timeout_ms: 20,
+            ..Default::default()
+        };
+        let manager = DatabaseManager::new(settings).await.unwrap();
+        let held = manager.acquire("tenant").await.unwrap();
+        assert!(matches!(
+            manager.acquire("other").await,
+            Err(AppError::Overloaded)
+        ));
+        assert_eq!(manager.stats().await.available_request_slots, 0);
+        drop(held);
+        assert!(manager.acquire("other").await.is_ok());
+        manager.close_all().await;
     }
 
     #[tokio::test]

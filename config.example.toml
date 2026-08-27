@@ -17,6 +17,10 @@ reader_connections = 2
 busy_timeout_ms = 5000
 acquire_timeout_seconds = 10
 max_result_rows = 10000
+# Overload is shed as 429 instead of being absorbed as latency.
+max_concurrent_requests = 512
+max_concurrent_requests_per_database = 8
+admission_timeout_ms = 250
 # Page cache per connection: the main dial for resident memory per tenant.
 cache_size_kb = 2000
 # Mapped bytes per connection; file-backed and evictable, unlike page cache.

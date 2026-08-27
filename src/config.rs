@@ -59,6 +59,13 @@ pub struct DatabaseSettings {
     pub busy_timeout_ms: u64,
     pub acquire_timeout_seconds: u64,
     pub max_result_rows: usize,
+    /// In-flight requests allowed across every database.
+    pub max_concurrent_requests: usize,
+    /// In-flight requests allowed for a single database, so one noisy
+    /// tenant cannot occupy the whole server.
+    pub max_concurrent_requests_per_database: usize,
+    /// How long a request waits for an admission slot before it is shed.
+    pub admission_timeout_ms: u64,
     /// SQLite page cache per connection. Multiplied by the connections of
     /// every hot database, this is the dial that sets resident memory.
     pub cache_size_kb: u32,
@@ -81,6 +88,9 @@ impl Default for DatabaseSettings {
             busy_timeout_ms: 5_000,
             acquire_timeout_seconds: 10,
             max_result_rows: 10_000,
+            max_concurrent_requests: 512,
+            max_concurrent_requests_per_database: 8,
+            admission_timeout_ms: 250,
             cache_size_kb: 2_000,
             mmap_size_mb: 64,
             wal_size_limit_mb: 16,
@@ -97,6 +107,9 @@ impl DatabaseSettings {
     }
     pub fn checkpoint_interval(&self) -> Duration {
         Duration::from_secs(self.checkpoint_interval_seconds)
+    }
+    pub fn admission_timeout(&self) -> Duration {
+        Duration::from_millis(self.admission_timeout_ms)
     }
 }
 
@@ -136,6 +149,10 @@ impl Settings {
             &mut self.database.max_result_rows,
         )?;
         set_number("TINKIVA_CACHE_SIZE_KB", &mut self.database.cache_size_kb)?;
+        set_number(
+            "TINKIVA_MAX_CONCURRENT_REQUESTS",
+            &mut self.database.max_concurrent_requests,
+        )?;
         set_number("TINKIVA_MMAP_SIZE_MB", &mut self.database.mmap_size_mb)?;
         Ok(())
     }
@@ -155,6 +172,12 @@ impl Settings {
         }
         if self.database.cache_size_kb == 0 {
             bail!("cache_size_kb must be greater than zero");
+        }
+        if self.database.max_concurrent_requests == 0 {
+            bail!("max_concurrent_requests must be greater than zero");
+        }
+        if self.database.max_concurrent_requests_per_database == 0 {
+            bail!("max_concurrent_requests_per_database must be greater than zero");
         }
         if self.database.max_result_rows == 0 {
             bail!("max_result_rows must be greater than zero");
