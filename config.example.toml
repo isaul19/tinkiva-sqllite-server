@@ -10,7 +10,8 @@ directory = "./data/databases"
 max_open_databases = 50
 idle_timeout_seconds = 300
 cleanup_interval_seconds = 30
-connections_per_database = 2
+# Read connections per database. One writer connection is always implied.
+reader_connections = 2
 busy_timeout_ms = 5000
 acquire_timeout_seconds = 10
 max_result_rows = 10000

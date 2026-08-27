@@ -121,6 +121,8 @@ pub struct BatchResponse {
     pub results: Vec<ExecuteResult>,
 }
 
+/// Reads run on the reader pool, which is opened `query_only`: a write sent
+/// here is rejected by SQLite and belongs on `/execute` or `/batch`.
 async fn query(
     State(state): State<AppState>,
     Path(database): Path<String>,
@@ -128,7 +130,7 @@ async fn query(
 ) -> Result<Json<QueryResponse>, AppError> {
     validate_sql(&request.sql)?;
     let lease = state.manager.acquire(&database).await?;
-    let mut stream = bind_query(&request.sql, request.params)?.fetch(&*lease);
+    let mut stream = bind_query(&request.sql, request.params)?.fetch(lease.readers());
     let limit = state.manager.max_result_rows();
     let mut rows = Vec::with_capacity(limit.min(256));
     let mut columns = Vec::new();
@@ -162,7 +164,7 @@ async fn execute(
     validate_sql(&request.sql)?;
     let lease = state.manager.acquire(&database).await?;
     let result = bind_query(&request.sql, request.params)?
-        .execute(&*lease)
+        .execute(lease.writer())
         .await?;
     Ok(Json(ExecuteResult {
         rows_affected: result.rows_affected(),
@@ -181,7 +183,7 @@ async fn batch(
         ));
     }
     let lease = state.manager.acquire(&database).await?;
-    let mut transaction = lease.begin().await?;
+    let mut transaction = lease.writer().begin().await?;
     let mut results = Vec::with_capacity(request.statements.len());
     for statement in request.statements {
         validate_sql(&statement.sql)?;
@@ -363,6 +365,40 @@ mod tests {
             .body(Body::from(
                 r#"{"sql":"SELECT count(*) AS total FROM ledger"}"#,
             ))
+            .unwrap();
+        let response = app.oneshot(count).await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["rows"][0]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn query_endpoint_refuses_writes() {
+        let (app, _dir) = test_app(None).await;
+        let create = Request::post("/v1/db/acme/execute")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(create).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let write_through_query = Request::post("/v1/db/acme/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sql":"INSERT INTO items(name) VALUES ('smuggled')"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(write_through_query).await.unwrap().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let count = Request::post("/v1/db/acme/query")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"sql":"SELECT count(*) AS total FROM items"}"#))
             .unwrap();
         let response = app.oneshot(count).await.unwrap();
         let body: Value =

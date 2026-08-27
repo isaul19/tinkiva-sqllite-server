@@ -50,7 +50,9 @@ pub struct DatabaseSettings {
     pub max_open_databases: usize,
     pub idle_timeout_seconds: u64,
     pub cleanup_interval_seconds: u64,
-    pub connections_per_database: u32,
+    /// Read connections per database. One writer connection is always
+    /// implied and is never shared with readers.
+    pub reader_connections: u32,
     pub busy_timeout_ms: u64,
     pub acquire_timeout_seconds: u64,
     pub max_result_rows: usize,
@@ -63,7 +65,7 @@ impl Default for DatabaseSettings {
             max_open_databases: 50,
             idle_timeout_seconds: 300,
             cleanup_interval_seconds: 30,
-            connections_per_database: 2,
+            reader_connections: 2,
             busy_timeout_ms: 5_000,
             acquire_timeout_seconds: 10,
             max_result_rows: 10_000,
@@ -108,8 +110,8 @@ impl Settings {
             &mut self.database.idle_timeout_seconds,
         )?;
         set_number(
-            "TINKIVA_CONNECTIONS_PER_DATABASE",
-            &mut self.database.connections_per_database,
+            "TINKIVA_READER_CONNECTIONS",
+            &mut self.database.reader_connections,
         )?;
         set_number(
             "TINKIVA_MAX_RESULT_ROWS",
@@ -122,8 +124,8 @@ impl Settings {
         if self.database.max_open_databases == 0 {
             bail!("max_open_databases must be greater than zero");
         }
-        if self.database.connections_per_database == 0 {
-            bail!("connections_per_database must be greater than zero");
+        if self.database.reader_connections == 0 {
+            bail!("reader_connections must be greater than zero");
         }
         if self.database.cleanup_interval_seconds == 0 {
             bail!("cleanup_interval_seconds must be greater than zero");

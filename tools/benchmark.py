@@ -241,7 +241,7 @@ def percentile(values, fraction):
 
 def run_scenario(index, scenario, duration):
     databases = scenario["databases"]
-    connections = scenario["connections"]
+    reader_pool = scenario["reader_pool"]
     readers = scenario["readers"]
     writers = scenario["writers"]
     read_operation = scenario.get("read", READ_INDEXED)
@@ -256,7 +256,7 @@ def run_scenario(index, scenario, duration):
             "TINKIVA_AUTH_TOKEN": TOKEN,
             "TINKIVA_DATABASE_DIR": str(data_dir),
             "TINKIVA_MAX_OPEN_DATABASES": str(databases),
-            "TINKIVA_CONNECTIONS_PER_DATABASE": str(connections),
+            "TINKIVA_READER_CONNECTIONS": str(reader_pool),
             "TINKIVA_MAX_RESULT_ROWS": "1000",
             "RUST_LOG": "error",
         }
@@ -310,7 +310,7 @@ def run_scenario(index, scenario, duration):
         return {
             "scenario": scenario["name"],
             "databases": databases,
-            "connections_per_db": connections,
+            "reader_connections": reader_pool,
             "users": databases * users_per_db,
             "readers_per_db": readers,
             "writers_per_db": writers,
@@ -343,18 +343,18 @@ def run_scenario(index, scenario, duration):
 
 
 SCENARIOS = [
-    {"name": "1db-pool1", "databases": 1, "connections": 1, "readers": 4, "writers": 1},
-    {"name": "1db-pool2", "databases": 1, "connections": 2, "readers": 4, "writers": 1},
-    {"name": "1db-pool5", "databases": 1, "connections": 5, "readers": 4, "writers": 1},
-    {"name": "5db-pool2", "databases": 5, "connections": 2, "readers": 4, "writers": 1},
-    {"name": "20db-pool2", "databases": 20, "connections": 2, "readers": 4, "writers": 1},
-    {"name": "50db-pool1", "databases": 50, "connections": 1, "readers": 4, "writers": 1},
-    {"name": "50db-pool2", "databases": 50, "connections": 2, "readers": 4, "writers": 1},
-    {"name": "20db-writeheavy", "databases": 20, "connections": 2, "readers": 1, "writers": 4},
+    {"name": "1db-read1", "databases": 1, "reader_pool": 1, "readers": 4, "writers": 1},
+    {"name": "1db-read2", "databases": 1, "reader_pool": 2, "readers": 4, "writers": 1},
+    {"name": "1db-read4", "databases": 1, "reader_pool": 4, "readers": 4, "writers": 1},
+    {"name": "5db-read2", "databases": 5, "reader_pool": 2, "readers": 4, "writers": 1},
+    {"name": "20db-read2", "databases": 20, "reader_pool": 2, "readers": 4, "writers": 1},
+    {"name": "50db-read1", "databases": 50, "reader_pool": 1, "readers": 4, "writers": 1},
+    {"name": "50db-read2", "databases": 50, "reader_pool": 2, "readers": 4, "writers": 1},
+    {"name": "20db-writeheavy", "databases": 20, "reader_pool": 2, "readers": 1, "writers": 4},
     {
         "name": "20db-scan",
         "databases": 20,
-        "connections": 2,
+        "reader_pool": 2,
         "readers": 4,
         "writers": 1,
         "read": READ_SCAN,

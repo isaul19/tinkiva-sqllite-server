@@ -1,5 +1,4 @@
 use std::{
-    ops::Deref,
     path::PathBuf,
     sync::{
         Arc,
@@ -33,11 +32,19 @@ pub struct DatabaseManager {
 
 pub struct DatabaseEntry {
     name: String,
-    pool: OnceCell<SqlitePool>,
+    pools: OnceCell<Pools>,
     last_used_ms: AtomicU64,
     active_leases: AtomicUsize,
 }
 pub struct DatabaseLease(Arc<DatabaseEntry>);
+
+/// SQLite serializes writes to a file no matter how many connections exist, so
+/// one writer is all a database can use. Readers get their own pool and their
+/// own WAL snapshots, and never queue behind the writer.
+struct Pools {
+    writer: SqlitePool,
+    readers: SqlitePool,
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct ManagerStats {
@@ -194,7 +201,7 @@ impl DatabaseEntry {
     fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
-            pool: OnceCell::new(),
+            pools: OnceCell::new(),
             last_used_ms: AtomicU64::new(now_ms()),
             active_leases: AtomicUsize::new(0),
         }
@@ -207,8 +214,8 @@ impl DatabaseEntry {
         settings: &DatabaseSettings,
         path: PathBuf,
     ) -> Result<(), sqlx::Error> {
-        self.pool
-            .get_or_try_init(|| open_pool(settings, path))
+        self.pools
+            .get_or_try_init(|| open_pools(settings, path))
             .await?;
         Ok(())
     }
@@ -242,7 +249,7 @@ impl DatabaseEntry {
     }
 }
 
-async fn open_pool(settings: &DatabaseSettings, path: PathBuf) -> Result<SqlitePool, sqlx::Error> {
+async fn open_pools(settings: &DatabaseSettings, path: PathBuf) -> Result<Pools, sqlx::Error> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -250,17 +257,39 @@ async fn open_pool(settings: &DatabaseSettings, path: PathBuf) -> Result<SqliteP
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_millis(settings.busy_timeout_ms));
-    SqlitePoolOptions::new()
-        .max_connections(settings.connections_per_database)
-        .acquire_timeout(Duration::from_secs(settings.acquire_timeout_seconds))
-        .connect_with(options)
-        .await
+    let acquire_timeout = Duration::from_secs(settings.acquire_timeout_seconds);
+
+    // The writer is established eagerly: it creates the file, and paying for it
+    // here keeps the cost inside the cold start instead of the first request.
+    let writer = SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .acquire_timeout(acquire_timeout)
+        .connect_with(options.clone())
+        .await?;
+
+    // Readers stay lazy, so a database that is only written never pays for
+    // reader connections. `query_only` is what makes them readers: a read-only
+    // open would not be able to attach the WAL index.
+    let readers = SqlitePoolOptions::new()
+        .max_connections(settings.reader_connections)
+        .acquire_timeout(acquire_timeout)
+        .connect_lazy_with(options.pragma("query_only", "ON"));
+
+    Ok(Pools { writer, readers })
 }
 
-impl Deref for DatabaseLease {
-    type Target = SqlitePool;
-    fn deref(&self) -> &Self::Target {
-        self.0.pool.get().expect("a leased entry is always open")
+impl DatabaseLease {
+    /// The single connection allowed to modify this database.
+    pub fn writer(&self) -> &SqlitePool {
+        &self.pools().writer
+    }
+    /// Connections restricted to reads, isolated from the writer.
+    pub fn readers(&self) -> &SqlitePool {
+        &self.pools().readers
+    }
+    fn pools(&self) -> &Pools {
+        self.0.pools.get().expect("a leased entry is always open")
     }
 }
 impl Drop for DatabaseLease {
@@ -270,13 +299,15 @@ impl Drop for DatabaseLease {
     }
 }
 async fn close_entry(entry: Arc<DatabaseEntry>) {
-    let Some(pool) = entry.pool.get() else {
+    let Some(pools) = entry.pools.get() else {
         return;
     };
+    // Readers hold WAL read marks that would block the checkpoint.
+    pools.readers.close().await;
     let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(pool)
+        .execute(&pools.writer)
         .await;
-    pool.close().await;
+    pools.writer.close().await;
     tracing::debug!(database = %entry.name, "database returned to sleep");
 }
 fn now_ms() -> u64 {
