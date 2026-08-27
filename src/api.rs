@@ -17,7 +17,7 @@ use serde::{
 };
 use serde_json::Value;
 use sqlx::{
-    Column, Row, Sqlite, TypeInfo, ValueRef,
+    Column, Either, Executor, Row, Sqlite, TypeInfo, ValueRef,
     sqlite::{SqliteArguments, SqliteRow},
 };
 use subtle::ConstantTimeEq;
@@ -134,13 +134,23 @@ pub struct QueryResponse {
     pub truncated: bool,
 }
 
-impl Serialize for QueryResponse {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut response = serializer.serialize_struct("QueryResponse", 3)?;
-        response.serialize_field("columns", &self.columns)?;
+impl QueryResponse {
+    fn empty(format: RowFormat) -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            format,
+            truncated: false,
+        }
+    }
+
+    /// Emits the row fields into an in-progress struct, so a batch entry can
+    /// carry them alongside its effect without a second serializer.
+    fn write_rows<S: SerializeStruct>(&self, target: &mut S) -> Result<(), S::Error> {
+        target.serialize_field("columns", &self.columns)?;
         match self.format {
-            RowFormat::Arrays => response.serialize_field("rows", &self.rows)?,
-            RowFormat::Objects => response.serialize_field(
+            RowFormat::Arrays => target.serialize_field("rows", &self.rows)?,
+            RowFormat::Objects => target.serialize_field(
                 "rows",
                 &RowsAsObjects {
                     columns: &self.columns,
@@ -148,7 +158,14 @@ impl Serialize for QueryResponse {
                 },
             )?,
         }
-        response.serialize_field("truncated", &self.truncated)?;
+        target.serialize_field("truncated", &self.truncated)
+    }
+}
+
+impl Serialize for QueryResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut response = serializer.serialize_struct("QueryResponse", 3)?;
+        self.write_rows(&mut response)?;
         response.end()
     }
 }
@@ -194,7 +211,26 @@ pub struct ExecuteResult {
 
 #[derive(Debug, Serialize)]
 pub struct BatchResponse {
-    pub results: Vec<ExecuteResult>,
+    pub results: Vec<BatchStatementResult>,
+}
+
+/// A statement's effect and whatever it returned. Batching only saves a round
+/// trip if reads can travel in it too, so every statement reports rows.
+#[derive(Debug)]
+pub struct BatchStatementResult {
+    pub rows_affected: u64,
+    pub last_insert_rowid: i64,
+    pub rows: QueryResponse,
+}
+
+impl Serialize for BatchStatementResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut result = serializer.serialize_struct("BatchStatementResult", 5)?;
+        result.serialize_field("rows_affected", &self.rows_affected)?;
+        result.serialize_field("last_insert_rowid", &self.last_insert_rowid)?;
+        self.rows.write_rows(&mut result)?;
+        result.end()
+    }
 }
 
 /// Reads run on the reader pool, which is opened `query_only`: a write sent
@@ -251,6 +287,8 @@ async fn execute(
     }))
 }
 
+/// Runs every statement in one transaction and returns what each produced,
+/// so a client can spend one round trip on a read-modify-read sequence.
 async fn batch(
     State(state): State<AppState>,
     Path(database): Path<String>,
@@ -261,18 +299,45 @@ async fn batch(
             "statements must not be empty".into(),
         ));
     }
+    let limit = state.manager.max_result_rows();
     let lease = state.manager.acquire(&database).await?;
     let mut transaction = lease.writer().begin().await?;
     let mut results = Vec::with_capacity(request.statements.len());
     for statement in request.statements {
         validate_sql(&statement.sql)?;
-        let result = bind_query(&statement.sql, statement.params)?
-            .execute(&mut *transaction)
-            .await?;
-        results.push(ExecuteResult {
-            rows_affected: result.rows_affected(),
-            last_insert_rowid: result.last_insert_rowid(),
-        });
+        let mut result = BatchStatementResult {
+            rows_affected: 0,
+            last_insert_rowid: 0,
+            rows: QueryResponse::empty(statement.format),
+        };
+        // Executor::fetch_many is the only path that reports both the rows a
+        // statement returned and the effect it had.
+        let mut stream =
+            (&mut *transaction).fetch_many(bind_query(&statement.sql, statement.params)?);
+        while let Some(item) = stream.try_next().await? {
+            match item {
+                Either::Left(effect) => {
+                    result.rows_affected = effect.rows_affected();
+                    result.last_insert_rowid = effect.last_insert_rowid();
+                }
+                Either::Right(row) => {
+                    if result.rows.columns.is_empty() {
+                        result.rows.columns = row
+                            .columns()
+                            .iter()
+                            .map(|column| column.name().to_owned())
+                            .collect();
+                    }
+                    if result.rows.rows.len() == limit {
+                        result.rows.truncated = true;
+                        break;
+                    }
+                    result.rows.rows.push(row_values(&row)?);
+                }
+            }
+        }
+        drop(stream);
+        results.push(result);
     }
     transaction.commit().await?;
     Ok(Json(BatchResponse { results }))
@@ -412,6 +477,33 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.oneshot(allowed).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn batch_returns_rows_for_each_statement() {
+        let (app, _dir) = test_app(None).await;
+        let batch = Request::post("/v1/db/acme/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"statements":[
+                    {"sql":"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"},
+                    {"sql":"INSERT INTO items(name) VALUES (?)","params":["book"]},
+                    {"sql":"SELECT id, name FROM items"}
+                ]}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(batch).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[1]["rows_affected"], 1);
+        assert_eq!(results[1]["last_insert_rowid"], 1);
+        assert!(results[1]["rows"].as_array().unwrap().is_empty());
+        assert_eq!(results[2]["columns"], serde_json::json!(["id", "name"]));
+        assert_eq!(results[2]["rows"][0]["name"], "book");
     }
 
     #[tokio::test]
