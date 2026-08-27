@@ -1,193 +1,132 @@
-Sí. Eso que buscas encaja perfectamente con SQLite, y de hecho yo evitaría sqld si quieres el mínimo
-consumo posible.
+# Guía de arquitectura de TinkivaDatabase
 
-La idea sería tener un único proceso Rust/Axum activo y cientos de archivos SQLite que solo se abren
-cuando alguien los usa.
+## Objetivo
 
-EC2 │ ├── tinkiva-db-server ← único proceso activo │ Rust + Axum │ └── /data/databases/ ├──
-empresa-001.db 💤 ├── empresa-002.db 💤 ├── empresa-003.db 💤 ├── empresa-004.db 💤 └── ...
+TinkivaDatabase permite alojar muchas bases SQLite aisladas usando un solo proceso Rust. Cada tenant
+se representa con un archivo y solo consume conexiones mientras está activo:
 
-Una base SQLite no es un proceso. Cuando nadie la tiene abierta, es literalmente un archivo en EBS:
+```text
+Cliente HTTP
+    │
+    ▼
+Axum :7000 ── autenticación, límites y timeout
+    │
+    ▼
+DatabaseManager ── leases + LRU + limpieza por inactividad
+    │
+    ├── acme.db       🟢 pool abierto
+    ├── litos.db      🟢 pool abierto
+    ├── codevia.db    💤 solo archivo
+    └── otros/*.db    💤 solo archivos
+```
 
-empresa-001.db
+Una base dormida no tiene proceso, hilo, pool ni memoria dedicada. Es un archivo en el volumen local.
+La caché de páginas que pueda conservar el sistema operativo es recuperable.
 
-No tiene:
+## Flujo de una solicitud
 
-CPU: 0 thread propio: 0 proceso propio: 0 RAM dedicada: 0
+1. La API valida el nombre del tenant para impedir rutas arbitrarias.
+2. `DatabaseManager` busca su entrada caliente.
+3. Si ya existe, incrementa su lease y reutiliza el pool.
+4. Si no existe, crea o abre `{tenant}.db` con WAL y los pragmas configurados.
+5. Si se alcanzó `max_open_databases`, elimina primero la base inactiva menos reciente.
+6. La operación SQL se ejecuta con parámetros posicionales.
+7. Al terminar, el lease disminuye y actualiza la hora del último uso.
 
-Puede quedar algo en la caché de archivos del kernel Linux, pero esa memoria es recuperable por el
-sistema cuando la necesita.
+El mutex del administrador serializa únicamente la búsqueda/apertura de pools. Las consultas se
+ejecutan fuera de ese mutex y pueden avanzar simultáneamente según `connections_per_database`.
 
-Tu servidor podría escuchar, por ejemplo, en:
+## Dormir una base con seguridad
 
-:7000
+Una tarea periódica identifica entradas cuyo último uso supera `idle_timeout_seconds`. Solo retira una
+entrada si su contador de leases es cero. Después ejecuta:
 
-y recibir:
+```sql
+PRAGMA wal_checkpoint(TRUNCATE);
+```
 
-GET /v1/db/litos/cats POST /v1/db/litos/cats
+y cierra el pool. Esto evita cortar consultas en curso y reduce el WAL antes de devolver la base al
+estado dormido. Si el checkpoint no puede completarse, el cierre sigue siendo seguro: SQLite conserva
+el WAL para recuperarlo al abrir de nuevo.
 
-GET /v1/db/codevia/products POST /v1/db/codevia/products
+## Concurrencia y consistencia
 
-Internamente:
+SQLite permite múltiples lectores, pero solo un escritor por archivo. WAL mejora la convivencia entre
+lecturas y escritura; no convierte SQLite en una base distribuida. `busy_timeout_ms` hace que una
+escritura espere brevemente ante contención en lugar de fallar inmediatamente.
 
-request ↓ tenant = "litos" ↓ /data/databases/litos.db ↓ ¿está abierta? │ ├─ sí → reutilizar conexión
-│ └─ no → abrir SQLite ↓ ejecutar ↓ responder Y la parte que buscas: volverla a “dormir”
+Para cambios que deban ser atómicos, `/batch` usa una sola transacción y conexión. No hay transacciones
+abiertas entre solicitudes HTTP.
 
-Podemos hacer un LRU de conexiones.
+El diseño esperado es un único proceso propietario de un directorio local. No se debe montar el mismo
+archivo SQLite para escritura concurrente desde varias instancias ni usar un filesystem de red sin
+garantías explícitas de bloqueo. Para escalar horizontalmente, asigne cada tenant a un shard estable:
 
-Por ejemplo:
+```text
+router de tenants
+   ├── hash 0..31  → instancia A + volumen A
+   ├── hash 32..63 → instancia B + volumen B
+   └── hash 64..95 → instancia C + volumen C
+```
 
-Máximo DB abiertas: 20 Timeout inactivo: 5 minutos
+## Límites de recursos
 
-Supón que tienes 500 empresas, pero solo 4 están usando el sistema ahora:
+El límite principal es:
 
-500 archivos SQLite
+```text
+conexiones máximas ≈ max_open_databases × connections_per_database
+```
 
-empresa-001.db 💤 empresa-002.db 💤 empresa-003.db 🟢 abierta empresa-004.db 💤 empresa-005.db 🟢
-abierta ... empresa-173.db 🟢 abierta ... empresa-411.db 🟢 abierta empresa-500.db 💤
+Con 50 bases abiertas y 2 conexiones por base, el techo es aproximadamente 100 conexiones SQLite.
+Puede haber miles de archivos dormidos sin crear miles de pools. El número apropiado depende de la
+RAM, el patrón de consultas, el page cache y la latencia del volumen.
 
-En RAM solo tendrías aproximadamente:
+La API también limita:
 
-Tinkiva DB Server
+- tamaño del body para evitar cargas descontroladas;
+- duración de cada solicitud;
+- filas materializadas por consulta;
+- longitud y caracteres del identificador de tenant.
 
-- 4 conexiones SQLite activas
-- cache de esas DB
+## Seguridad
 
-Las otras 496 DB no estarían consumiendo recursos propios.
+El MVP ofrece un bearer token global opcional. En producción:
 
-Después de, digamos, cinco minutos:
+- configure el token mediante secreto/variable de entorno, no dentro de Git;
+- termine TLS en un proxy o balanceador;
+- mantenga el servicio en una red privada;
+- trate el endpoint SQL como acceso total a cada base;
+- ejecute el proceso con permisos exclusivos sobre el directorio de datos;
+- establezca cuotas y credenciales por tenant antes de ofrecer acceso público directo.
 
-empresa-003.db sin requests 1 min ↓ cerrar conexiones ↓ SQLite checkpoint si corresponde ↓ remover
-del pool ↓ 💤 WAL sigue funcionando perfectamente
+## Backups y recuperación
 
-Cuando abrimos la DB por primera vez podemos ejecutar/configurar:
+Los backups deben respetar WAL. Opciones válidas incluyen la API de backup de SQLite, `VACUUM INTO`,
+o snapshots de volumen coordinados después de un checkpoint. Se deben probar restauraciones, no solo
+la creación de copias.
 
-PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA
-busy_timeout = 1000;
+El apagado normal cierra todos los pools y realiza checkpoints. Ante caída abrupta, WAL permite que
+SQLite recupere una transacción consistente al volver a abrir el archivo.
 
-Si alguien hace una peticion se resetea el contador
+## Alcance actual
 
-Eso queda configurado por base de datos.
+Incluido:
 
-Mientras está activa podrías tener:
+- activación bajo demanda y creación lazy;
+- pools limitados por base;
+- evicción LRU y timeout inactivo;
+- WAL, claves foráneas, timeout de escritura y checkpoint;
+- endpoints de consulta, ejecución, batch, salud y estadísticas;
+- autenticación bearer, límites HTTP y apagado ordenado.
 
-litos.db litos.db-wal litos.db-shm
+No incluido todavía:
 
-y cuando ya no la utilizamos:
+- almacenamiento COLD/S3 o descarga automática;
+- replicación o failover multi-instancia;
+- migraciones administradas;
+- credenciales/cuotas por tenant;
+- backups programados;
+- protocolo compatible con PostgreSQL/MySQL.
 
-cerramos las conexiones ↓ checkpoint ↓ la DB queda simplemente almacenada
-
-No necesitas un daemon SQLite por cada una.
-
-Yo construiría exactamente esto en Rust
-
-Algo conceptualmente así:
-
-struct DatabaseManager { databases: HashMap<String, DatabaseHandle>, max_open: usize, idle_timeout:
-Duration, }
-
-Cada handle:
-
-struct DatabaseHandle { connection: Connection, last_used: Instant, }
-
-Y:
-
-                 Axum :7000
-                     │
-                     ▼
-             DatabaseManager
-                     │
-           ┌─────────┴──────────┐
-           │                    │
-       Active DBs            Sleeping
-           │                    │
-      ┌────┼────┐         ┌─────┼─────┐
-      ▼    ▼    ▼         ▼     ▼     ▼
-     A.db B.db C.db       D.db  E.db  F.db
-      ↑    ↑    ↑
-    RAM/cache              0 runtime
-
-Un background task cada minuto podría hacer:
-
-for database in open_databases:
-
-    if now - last_used > 5 min:
-        checkpoint
-        close
-        remove_from_pool
-
-Esto escala de una forma muy interesante
-
-Podrías tener:
-
-10 DB 100 DB 1,000 DB 10,000 DB
-
-y eso no significa tener 10,000 bases cargadas en RAM.
-
-Podrías definir:
-
-10,000 databases almacenadas 50 máximo abiertas simultáneamente
-
-Por ejemplo:
-
-[database] directory = "/var/lib/tinkivadb" journal_mode = "wal"
-
-[pool] max_open_databases = 50 idle_timeout = "5m" connections_per_database = 2
-
-Y aunque tengas 10,000 clientes:
-
-disco: 10,000 .db
-
-RAM: solo las DB utilizadas recientemente Incluso podríamos llevarlo más lejos
-
-Si después de 30 días una empresa no usa su DB:
-
-HOT EBS ↓ 30 días inactiva ↓ COLD S3
-
-Entonces:
-
-empresa-001.db → EBS empresa-002.db → EBS empresa-003.db → S3 🧊 empresa-004.db → S3 🧊
-
-Cuando vuelve el cliente:
-
-request empresa-003 ↓ DB no está local ↓ descargar S3 ↓ abrir SQLite ↓ HOT
-
-Eso ya empezaría a parecerse muchísimo a una plataforma serverless:
-
-             TinkivaDB :7000
-
-                    │
-       ┌────────────┼────────────┐
-       ▼            ▼            ▼
-
-    HOT DB       HOT DB       HOT DB
-      RAM          RAM          RAM
-
-────────────────────────────────────
-
-      SQLite files en EBS
-             💤 💤 💤
-
-────────────────────────────────────
-
-       DB archivadas en S3
-             🧊 🧊 🧊
-
-Y eso es exactamente lo que entiendo que buscas
-
-No:
-
-# 100 databases
-
-100 procesos
-
-sino:
-
-1 proceso Rust │ ├── abre DB cuando se usa ├── mantiene unas pocas calientes ├── cierra DB inactivas
-└── miles de SQLite dormidas
-
-Eso sí me parece más interesante que instalar sqld, porque es bastante sencillo de construir,
-extremadamente ligero y podemos controlar exactamente el comportamiento de memoria que quieres.
-
-En una t4g.small de 2 GB, una arquitectura así podría alojar muchísimas bases SQLite pequeñas,
-siempre que solo una fracción esté activa simultáneamente.
+Estas exclusiones son deliberadas: el núcleo actual conserva el objetivo de consumo mínimo y un modelo
+de consistencia sencillo de operar.

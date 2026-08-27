@@ -1,0 +1,16 @@
+[server]
+# Keep this on loopback when using a reverse proxy.
+bind = "127.0.0.1:7000"
+auth_token = "change-me"
+body_limit_bytes = 1048576
+request_timeout_seconds = 30
+
+[database]
+directory = "./data/databases"
+max_open_databases = 50
+idle_timeout_seconds = 300
+cleanup_interval_seconds = 30
+connections_per_database = 2
+busy_timeout_ms = 5000
+acquire_timeout_seconds = 10
+max_result_rows = 10000
